@@ -131,4 +131,64 @@
     const parsed = await DA.parseContainer(rx.assemble());
     return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
   };
+  /** Full SOUNDONLY file transfer via WebAudio MediaStream loopback (TX→RX listen). */
+  DA.transferSoundOnlyVirtualLoopback = async function transferSoundOnlyVirtualLoopback(fileBytes, fileName, mime) {
+    const container = await DA.buildContainer(fileName || "file.bin", mime || "application/octet-stream", fileBytes);
+    const profile = DA.resolveBandProfile(null);
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: 48,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+    const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: tx.blockLen,
+      sessionId: tx.sessionId,
+    });
+    rx.k = tx.k;
+    rx.blockLen = tx.blockLen;
+    rx.totalLen = tx.totalLen;
+    rx.received = new Array(tx.k).fill(null);
+
+    const loop = await DA.AudioIO.createLoopback();
+    const sampleRate = loop.ctx.sampleRate;
+    const listen = await DA.AudioIO.startListenLoop(
+      profile,
+      (frame) => {
+        if (frame.kind === DA.FRAME_DATA && frame.sessionId === tx.sessionId) {
+          rx.acceptBlock(frame.seq, frame.payload);
+        }
+      },
+      { inputStream: loop.stream, windowSec: 14, maxBurstSec: 14 }
+    );
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    async function playBytes(bytes) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      const lead = Math.floor(sampleRate * 0.05);
+      const trail = Math.floor(sampleRate * 0.35);
+      const padded = new Float32Array(pcm.length + lead + trail);
+      padded.set(pcm, lead);
+      await DA.AudioIO.playPcm(padded, sampleRate, { silent: true, loopDest: loop.dest, gain: 1, boost: 1 });
+      await new Promise((r) => setTimeout(r, 700));
+    }
+
+    await playBytes(tx.packMetaFrame({ name: fileName || "file.bin", bandId: profile.id }));
+    for (let seq = 0; seq < tx.k; seq++) {
+      await playBytes(tx.packDataFrame(seq));
+      if (rx.received[seq] == null) await playBytes(tx.packDataFrame(seq));
+    }
+    await new Promise((r) => setTimeout(r, 900));
+    listen.stop();
+    await new Promise((r) => setTimeout(r, 150));
+
+    if (rx.solvedCount() < rx.k) {
+      return { ok: false, message: "loopback incomplete " + rx.solvedCount() + "/" + rx.k, solved: rx.solvedCount(), k: tx.k };
+    }
+    const parsed = await DA.parseContainer(rx.assemble());
+    return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
+  };
 })(typeof globalThis !== "undefined" ? globalThis : window);

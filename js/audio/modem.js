@@ -13,6 +13,8 @@
   function writeSymbol(pcm, symIndex, symbolSamples, freqs, pairs, sampleRate, bits /* length pairs, 0/1 */) {
     const base = symIndex * symbolSamples;
     const fade = Math.min(64, Math.floor(symbolSamples / 6));
+    // Keep peak ≤ ~0.85 even if all carriers align (avoids TX clip → RX FEC fail)
+    const amp = 0.82 / Math.max(1, pairs);
     for (let p = 0; p < pairs; p++) {
       const bit = bits[p] ? 1 : 0;
       const freq = bit ? freqs[p * 2] : freqs[p * 2 + 1];
@@ -21,7 +23,7 @@
         let env = 1;
         if (i < fade) env = i / fade;
         else if (i > symbolSamples - fade) env = (symbolSamples - i) / fade;
-        pcm[base + i] += Math.sin(w * i) * 0.28 * env;
+        pcm[base + i] += Math.sin(w * i) * amp * env;
       }
     }
   }
@@ -104,9 +106,14 @@
       }
       writeSymbol(pcm, s++, symbolSamples, freqs, pairs, sampleRate, fillBits(0));
 
+      let peak = 0;
       for (let i = 0; i < pcm.length; i++) {
-        const x = pcm[i];
-        pcm[i] = x > 1 ? 1 : x < -1 ? -1 : x;
+        const a = Math.abs(pcm[i]);
+        if (a > peak) peak = a;
+      }
+      if (peak > 1e-6) {
+        const scale = 0.88 / peak;
+        for (let i = 0; i < pcm.length; i++) pcm[i] *= scale;
       }
       return { pcm, symbolSamples, freqs, pairs, fecLen: fec.length };
     },
@@ -118,11 +125,15 @@
 
       let bestOff = -1;
       let bestScore = -Infinity;
-      const coarse = Math.max(24, Math.floor(symbolSamples / 2));
-      // Search start of buffer and last ~7s (frame may sit at end of rolling window)
-      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * 3))]];
-      if (pcm.length > sampleRate * 4) {
-        regions.push([Math.max(0, pcm.length - Math.floor(sampleRate * 7)), pcm.length]);
+      const coarse = Math.max(12, Math.floor(symbolSamples / 4));
+      const searchSec = opts.searchSec != null ? opts.searchSec : 1.5;
+      // Bursts start at energy onset — preamble is near the front.
+      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * searchSec))]];
+      if (opts.scanTail && pcm.length > sampleRate * 5) {
+        regions.push([
+          Math.max(0, pcm.length - Math.floor(sampleRate * 9)),
+          pcm.length,
+        ]);
       }
       for (const [r0, r1] of regions) {
         const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));

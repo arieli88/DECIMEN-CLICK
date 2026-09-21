@@ -122,13 +122,17 @@
     const ctx = await DA.AudioIO.ensureContext();
     await ctx.resume();
     const { pcm } = DA.Modem.encodePcm(bytes, profile, ctx.sampleRate);
+    const lead = Math.floor(ctx.sampleRate * 0.04);
+    const trail = Math.floor(ctx.sampleRate * 0.35);
+    const padded = new Float32Array(pcm.length + lead + trail);
+    padded.set(pcm, lead);
     const viz = ensureViz();
     if (viz) {
       viz.setMode("tx");
-      viz.showPcm(pcm);
+      viz.showPcm(padded);
     }
     const opts = {
-      boost: 2.8,
+      boost: 1.05,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
@@ -136,9 +140,9 @@
     if (state.loopback && state.loopback.dest) {
       opts.loopDest = state.loopback.dest;
     }
-    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, opts);
-    // Quiet gap so RX burst detector can separate frames
-    await new Promise((r) => setTimeout(r, 400));
+    await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
+    // Quiet gap so RX burst detector can close the frame and decode off-thread
+    await new Promise((r) => setTimeout(r, 750));
   }
 
   async function startNackListen() {

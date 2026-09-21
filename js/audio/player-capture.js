@@ -25,7 +25,8 @@
       const buffer = ctx.createBuffer(1, pcm.length, rate);
       const ch = buffer.getChannelData(0);
       const srcPcm = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
-      const boost = opts.boost != null ? opts.boost : 2.6;
+      // Default boost 1.0 — previous 2.6 hard-clipped MFSK and broke FEC over speakers/mic
+      const boost = opts.boost != null ? opts.boost : 1.0;
       for (let i = 0; i < srcPcm.length; i++) {
         let x = srcPcm[i] * boost;
         ch[i] = x > 1 ? 1 : x < -1 ? -1 : x;
@@ -184,6 +185,10 @@
       let noiseFloor = 0.002;
       let lastRoll = 0;
       const seen = new Set();
+      // NEVER run Goertzel decode inside onaudioprocess — it drops mic samples and corrupts frames.
+      let decodeQueue = [];
+      let decodeScheduled = false;
+      let decoding = false;
 
       function emit(result) {
         if (!result || !result.frame) return;
@@ -195,15 +200,43 @@
         onFrame(f, result);
       }
 
-      function tryDecode(pcmSnap) {
+      function enqueueDecode(pcmSnap, delayMs) {
+        if (!pcmSnap || pcmSnap.length < sampleRate * 0.15) return;
+        if (decodeQueue.length >= 3) decodeQueue.shift();
+        decodeQueue.push(pcmSnap);
+        if (!decodeScheduled) {
+          decodeScheduled = true;
+          // Delay so ScriptProcessor can keep draining without competing with Goertzel
+          setTimeout(pumpDecode, delayMs != null ? delayMs : 40);
+        }
+      }
+
+      function pumpDecode() {
+        decodeScheduled = false;
+        if (stopped && !decodeQueue.length) return;
+        if (decoding) {
+          decodeScheduled = true;
+          setTimeout(pumpDecode, 30);
+          return;
+        }
+        const snap = decodeQueue.shift();
+        if (!snap) return;
+        decoding = true;
         try {
           emit(
-            DA.Modem.decodePcm(pcmSnap, profile, sampleRate, {
+            DA.Modem.decodePcm(snap, profile, sampleRate, {
               maxBytes: options.maxBytes || 8192,
+              searchSec: options.searchSec || 1.2,
             })
           );
         } catch (err) {
           console.warn("decode", err);
+        } finally {
+          decoding = false;
+          if (decodeQueue.length && !stopped) {
+            decodeScheduled = true;
+            setTimeout(pumpDecode, 20);
+          }
         }
       }
 
@@ -214,10 +247,10 @@
           inBurst = false;
           return;
         }
-        const snap = burst.subarray(0, burstPos);
+        const snap = burst.slice(0, burstPos);
         const padded = new Float32Array(snap.length + Math.floor(sampleRate * 0.04));
         padded.set(snap, Math.floor(sampleRate * 0.015));
-        tryDecode(padded);
+        enqueueDecode(padded, 60);
         burst = null;
         burstPos = 0;
         inBurst = false;
@@ -234,7 +267,7 @@
 
         const r = rmsOf(input);
         if (!inBurst) noiseFloor = noiseFloor * 0.95 + r * 0.05;
-        const thresh = Math.max(0.008, noiseFloor * 4.5);
+        const thresh = Math.max(0.004, noiseFloor * 3.5);
 
         if (r > thresh) {
           if (!inBurst) {
@@ -257,16 +290,25 @@
             burstPos += n;
           }
           quietChunks++;
-          if (quietChunks >= 10) finishBurst();
+          // ~0.5s quiet at 2048/48k — end of frame
+          if (quietChunks >= 12) finishBurst();
         }
 
         const now = performance.now();
-        if (now - lastRoll >= (options.intervalMs || 450) && filled > sampleRate * 1.5) {
+        // Rolling is opt-in; burst-end decode is the reliable path.
+        if (
+          options.rolling === true &&
+          !inBurst &&
+          !decoding &&
+          now - lastRoll >= (options.intervalMs || 1200) &&
+          filled > sampleRate * 4
+        ) {
           lastRoll = now;
-          const snap = new Float32Array(filled);
-          const start = (writePos - filled + ringLen) % ringLen;
-          for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % ringLen];
-          tryDecode(snap);
+          const snap = new Float32Array(Math.min(filled, Math.ceil(sampleRate * 11)));
+          const take = snap.length;
+          const start = (writePos - take + ringLen) % ringLen;
+          for (let i = 0; i < take; i++) snap[i] = ring[(start + i) % ringLen];
+          enqueueDecode(snap, 80);
         }
       };
 
@@ -277,6 +319,17 @@
         stop() {
           stopped = true;
           if (inBurst) finishBurst();
+          // Drain any queued snapshots off the audio thread
+          while (decodeQueue.length) {
+            const snap = decodeQueue.shift();
+            try {
+              emit(
+                DA.Modem.decodePcm(snap, profile, sampleRate, {
+                  maxBytes: options.maxBytes || 8192,
+                })
+              );
+            } catch (_) {}
+          }
           try {
             processor.disconnect();
             source.disconnect();

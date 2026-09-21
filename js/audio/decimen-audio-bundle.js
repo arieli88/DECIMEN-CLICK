@@ -342,6 +342,8 @@
   function writeSymbol(pcm, symIndex, symbolSamples, freqs, pairs, sampleRate, bits /* length pairs, 0/1 */) {
     const base = symIndex * symbolSamples;
     const fade = Math.min(64, Math.floor(symbolSamples / 6));
+    // Keep peak ≤ ~0.85 even if all carriers align (avoids TX clip → RX FEC fail)
+    const amp = 0.82 / Math.max(1, pairs);
     for (let p = 0; p < pairs; p++) {
       const bit = bits[p] ? 1 : 0;
       const freq = bit ? freqs[p * 2] : freqs[p * 2 + 1];
@@ -350,7 +352,7 @@
         let env = 1;
         if (i < fade) env = i / fade;
         else if (i > symbolSamples - fade) env = (symbolSamples - i) / fade;
-        pcm[base + i] += Math.sin(w * i) * 0.28 * env;
+        pcm[base + i] += Math.sin(w * i) * amp * env;
       }
     }
   }
@@ -433,9 +435,14 @@
       }
       writeSymbol(pcm, s++, symbolSamples, freqs, pairs, sampleRate, fillBits(0));
 
+      let peak = 0;
       for (let i = 0; i < pcm.length; i++) {
-        const x = pcm[i];
-        pcm[i] = x > 1 ? 1 : x < -1 ? -1 : x;
+        const a = Math.abs(pcm[i]);
+        if (a > peak) peak = a;
+      }
+      if (peak > 1e-6) {
+        const scale = 0.88 / peak;
+        for (let i = 0; i < pcm.length; i++) pcm[i] *= scale;
       }
       return { pcm, symbolSamples, freqs, pairs, fecLen: fec.length };
     },
@@ -447,11 +454,15 @@
 
       let bestOff = -1;
       let bestScore = -Infinity;
-      const coarse = Math.max(24, Math.floor(symbolSamples / 2));
-      // Search start of buffer and last ~7s (frame may sit at end of rolling window)
-      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * 3))]];
-      if (pcm.length > sampleRate * 4) {
-        regions.push([Math.max(0, pcm.length - Math.floor(sampleRate * 7)), pcm.length]);
+      const coarse = Math.max(12, Math.floor(symbolSamples / 4));
+      const searchSec = opts.searchSec != null ? opts.searchSec : 1.5;
+      // Bursts start at energy onset — preamble is near the front.
+      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * searchSec))]];
+      if (opts.scanTail && pcm.length > sampleRate * 5) {
+        regions.push([
+          Math.max(0, pcm.length - Math.floor(sampleRate * 9)),
+          pcm.length,
+        ]);
       }
       for (const [r0, r1] of regions) {
         const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));
@@ -564,7 +575,8 @@
       const buffer = ctx.createBuffer(1, pcm.length, rate);
       const ch = buffer.getChannelData(0);
       const srcPcm = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
-      const boost = opts.boost != null ? opts.boost : 2.6;
+      // Default boost 1.0 — previous 2.6 hard-clipped MFSK and broke FEC over speakers/mic
+      const boost = opts.boost != null ? opts.boost : 1.0;
       for (let i = 0; i < srcPcm.length; i++) {
         let x = srcPcm[i] * boost;
         ch[i] = x > 1 ? 1 : x < -1 ? -1 : x;
@@ -723,6 +735,10 @@
       let noiseFloor = 0.002;
       let lastRoll = 0;
       const seen = new Set();
+      // NEVER run Goertzel decode inside onaudioprocess — it drops mic samples and corrupts frames.
+      let decodeQueue = [];
+      let decodeScheduled = false;
+      let decoding = false;
 
       function emit(result) {
         if (!result || !result.frame) return;
@@ -734,15 +750,43 @@
         onFrame(f, result);
       }
 
-      function tryDecode(pcmSnap) {
+      function enqueueDecode(pcmSnap, delayMs) {
+        if (!pcmSnap || pcmSnap.length < sampleRate * 0.15) return;
+        if (decodeQueue.length >= 3) decodeQueue.shift();
+        decodeQueue.push(pcmSnap);
+        if (!decodeScheduled) {
+          decodeScheduled = true;
+          // Delay so ScriptProcessor can keep draining without competing with Goertzel
+          setTimeout(pumpDecode, delayMs != null ? delayMs : 40);
+        }
+      }
+
+      function pumpDecode() {
+        decodeScheduled = false;
+        if (stopped && !decodeQueue.length) return;
+        if (decoding) {
+          decodeScheduled = true;
+          setTimeout(pumpDecode, 30);
+          return;
+        }
+        const snap = decodeQueue.shift();
+        if (!snap) return;
+        decoding = true;
         try {
           emit(
-            DA.Modem.decodePcm(pcmSnap, profile, sampleRate, {
+            DA.Modem.decodePcm(snap, profile, sampleRate, {
               maxBytes: options.maxBytes || 8192,
+              searchSec: options.searchSec || 1.2,
             })
           );
         } catch (err) {
           console.warn("decode", err);
+        } finally {
+          decoding = false;
+          if (decodeQueue.length && !stopped) {
+            decodeScheduled = true;
+            setTimeout(pumpDecode, 20);
+          }
         }
       }
 
@@ -753,10 +797,10 @@
           inBurst = false;
           return;
         }
-        const snap = burst.subarray(0, burstPos);
+        const snap = burst.slice(0, burstPos);
         const padded = new Float32Array(snap.length + Math.floor(sampleRate * 0.04));
         padded.set(snap, Math.floor(sampleRate * 0.015));
-        tryDecode(padded);
+        enqueueDecode(padded, 60);
         burst = null;
         burstPos = 0;
         inBurst = false;
@@ -773,7 +817,7 @@
 
         const r = rmsOf(input);
         if (!inBurst) noiseFloor = noiseFloor * 0.95 + r * 0.05;
-        const thresh = Math.max(0.008, noiseFloor * 4.5);
+        const thresh = Math.max(0.004, noiseFloor * 3.5);
 
         if (r > thresh) {
           if (!inBurst) {
@@ -796,16 +840,25 @@
             burstPos += n;
           }
           quietChunks++;
-          if (quietChunks >= 10) finishBurst();
+          // ~0.5s quiet at 2048/48k — end of frame
+          if (quietChunks >= 12) finishBurst();
         }
 
         const now = performance.now();
-        if (now - lastRoll >= (options.intervalMs || 450) && filled > sampleRate * 1.5) {
+        // Rolling is opt-in; burst-end decode is the reliable path.
+        if (
+          options.rolling === true &&
+          !inBurst &&
+          !decoding &&
+          now - lastRoll >= (options.intervalMs || 1200) &&
+          filled > sampleRate * 4
+        ) {
           lastRoll = now;
-          const snap = new Float32Array(filled);
-          const start = (writePos - filled + ringLen) % ringLen;
-          for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % ringLen];
-          tryDecode(snap);
+          const snap = new Float32Array(Math.min(filled, Math.ceil(sampleRate * 11)));
+          const take = snap.length;
+          const start = (writePos - take + ringLen) % ringLen;
+          for (let i = 0; i < take; i++) snap[i] = ring[(start + i) % ringLen];
+          enqueueDecode(snap, 80);
         }
       };
 
@@ -816,6 +869,17 @@
         stop() {
           stopped = true;
           if (inBurst) finishBurst();
+          // Drain any queued snapshots off the audio thread
+          while (decodeQueue.length) {
+            const snap = decodeQueue.shift();
+            try {
+              emit(
+                DA.Modem.decodePcm(snap, profile, sampleRate, {
+                  maxBytes: options.maxBytes || 8192,
+                })
+              );
+            } catch (_) {}
+          }
           try {
             processor.disconnect();
             source.disconnect();
@@ -1449,6 +1513,66 @@
     const parsed = await DA.parseContainer(rx.assemble());
     return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
   };
+  /** Full SOUNDONLY file transfer via WebAudio MediaStream loopback (TX→RX listen). */
+  DA.transferSoundOnlyVirtualLoopback = async function transferSoundOnlyVirtualLoopback(fileBytes, fileName, mime) {
+    const container = await DA.buildContainer(fileName || "file.bin", mime || "application/octet-stream", fileBytes);
+    const profile = DA.resolveBandProfile(null);
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: 48,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+    const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: tx.blockLen,
+      sessionId: tx.sessionId,
+    });
+    rx.k = tx.k;
+    rx.blockLen = tx.blockLen;
+    rx.totalLen = tx.totalLen;
+    rx.received = new Array(tx.k).fill(null);
+
+    const loop = await DA.AudioIO.createLoopback();
+    const sampleRate = loop.ctx.sampleRate;
+    const listen = await DA.AudioIO.startListenLoop(
+      profile,
+      (frame) => {
+        if (frame.kind === DA.FRAME_DATA && frame.sessionId === tx.sessionId) {
+          rx.acceptBlock(frame.seq, frame.payload);
+        }
+      },
+      { inputStream: loop.stream, windowSec: 14, maxBurstSec: 14 }
+    );
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    async function playBytes(bytes) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      const lead = Math.floor(sampleRate * 0.05);
+      const trail = Math.floor(sampleRate * 0.35);
+      const padded = new Float32Array(pcm.length + lead + trail);
+      padded.set(pcm, lead);
+      await DA.AudioIO.playPcm(padded, sampleRate, { silent: true, loopDest: loop.dest, gain: 1, boost: 1 });
+      await new Promise((r) => setTimeout(r, 700));
+    }
+
+    await playBytes(tx.packMetaFrame({ name: fileName || "file.bin", bandId: profile.id }));
+    for (let seq = 0; seq < tx.k; seq++) {
+      await playBytes(tx.packDataFrame(seq));
+      if (rx.received[seq] == null) await playBytes(tx.packDataFrame(seq));
+    }
+    await new Promise((r) => setTimeout(r, 900));
+    listen.stop();
+    await new Promise((r) => setTimeout(r, 150));
+
+    if (rx.solvedCount() < rx.k) {
+      return { ok: false, message: "loopback incomplete " + rx.solvedCount() + "/" + rx.k, solved: rx.solvedCount(), k: tx.k };
+    }
+    const parsed = await DA.parseContainer(rx.assemble());
+    return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
+  };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
 /* ---- bridge-sender.js ---- */
@@ -1576,13 +1700,17 @@
     const ctx = await DA.AudioIO.ensureContext();
     await ctx.resume();
     const { pcm } = DA.Modem.encodePcm(bytes, profile, ctx.sampleRate);
+    const lead = Math.floor(ctx.sampleRate * 0.04);
+    const trail = Math.floor(ctx.sampleRate * 0.35);
+    const padded = new Float32Array(pcm.length + lead + trail);
+    padded.set(pcm, lead);
     const viz = ensureViz();
     if (viz) {
       viz.setMode("tx");
-      viz.showPcm(pcm);
+      viz.showPcm(padded);
     }
     const opts = {
-      boost: 2.8,
+      boost: 1.05,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
@@ -1590,9 +1718,9 @@
     if (state.loopback && state.loopback.dest) {
       opts.loopDest = state.loopback.dest;
     }
-    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, opts);
-    // Quiet gap so RX burst detector can separate frames
-    await new Promise((r) => setTimeout(r, 400));
+    await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
+    // Quiet gap so RX burst detector can close the frame and decode off-thread
+    await new Promise((r) => setTimeout(r, 750));
   }
 
   async function startNackListen() {
@@ -2129,7 +2257,11 @@
               state.listen.stop();
               state.listen = null;
             }
-            DA.AudioIO.startListenLoop(s.profile, onFrame, { windowSec: 3.5, intervalMs: 300, maxBytes: 8192 }).then((l) => {
+            DA.AudioIO.startListenLoop(s.profile, onFrame, {
+              windowSec: 12,
+              maxBurstSec: 14,
+              maxBytes: 8192,
+            }).then((l) => {
               state.listen = l;
             });
           }
@@ -2185,8 +2317,8 @@
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
     state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 3.5,
-      intervalMs: 300,
+      windowSec: 12,
+      maxBurstSec: 14,
       maxBytes: 8192,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
@@ -2355,4 +2487,4 @@
   DA.ReceiverBridge = { state, speakNack, stopListen, applyModeUi };
 })();
 
-try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.runSoundOnlySelfTest && window.DecimenAudio.transferSoundOnlyOffline); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }
+try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO); if (!window.__DECIMEN_AUDIO_BUNDLE_OK) window.__DECIMEN_AUDIO_BUNDLE_ERR = new Error("DecimenAudio incomplete after bundle"); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_OK = false; window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }

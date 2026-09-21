@@ -208,7 +208,11 @@
               state.listen.stop();
               state.listen = null;
             }
-            DA.AudioIO.startListenLoop(s.profile, onFrame, { windowSec: 3.5, intervalMs: 300, maxBytes: 8192 }).then((l) => {
+            DA.AudioIO.startListenLoop(s.profile, onFrame, {
+              windowSec: 12,
+              maxBurstSec: 14,
+              maxBytes: 8192,
+            }).then((l) => {
               state.listen = l;
             });
           }
@@ -264,8 +268,8 @@
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
     state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 3.5,
-      intervalMs: 300,
+      windowSec: 12,
+      maxBurstSec: 14,
       maxBytes: 8192,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
