@@ -118,22 +118,49 @@
 
       let bestOff = -1;
       let bestScore = -Infinity;
-      const scanStep = Math.max(1, Math.floor(symbolSamples / 12));
-      const maxScan = Math.min(Math.max(0, pcm.length - symbolSamples * (PREAMBLE_BITS.length + 10)), sampleRate * 5);
-      for (let off = 0; off < maxScan; off += scanStep) {
-        let score = 0;
-        for (let p = 0; p < PREAMBLE_BITS.length; p++) {
-          const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
-          if (bits[0] === PREAMBLE_BITS[p]) score++;
-          else score--;
-          if (pairs > 1) {
-            if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+      const coarse = Math.max(24, Math.floor(symbolSamples / 2));
+      // Search start of buffer and last ~7s (frame may sit at end of rolling window)
+      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * 3))]];
+      if (pcm.length > sampleRate * 4) {
+        regions.push([Math.max(0, pcm.length - Math.floor(sampleRate * 7)), pcm.length]);
+      }
+      for (const [r0, r1] of regions) {
+        const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));
+        for (let off = r0; off < limit; off += coarse) {
+          let score = 0;
+          for (let p = 0; p < PREAMBLE_BITS.length; p++) {
+            const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
+            if (bits[0] === PREAMBLE_BITS[p]) score++;
             else score--;
+            if (pairs > 1) {
+              if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+              else score--;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestOff = off;
           }
         }
-        if (score > bestScore) {
-          bestScore = score;
-          bestOff = off;
+      }
+      if (bestOff >= 0) {
+        const lo = Math.max(0, bestOff - coarse);
+        const hi = bestOff + coarse;
+        for (let off = lo; off <= hi; off += Math.max(4, Math.floor(coarse / 6))) {
+          let score = 0;
+          for (let p = 0; p < PREAMBLE_BITS.length; p++) {
+            const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
+            if (bits[0] === PREAMBLE_BITS[p]) score++;
+            else score--;
+            if (pairs > 1) {
+              if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+              else score--;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestOff = off;
+          }
         }
       }
       const needScore = PREAMBLE_BITS.length * (pairs > 1 ? 1.2 : 0.6);

@@ -1,6 +1,12 @@
-/* Decimen audio — play PCM / capture mic to PCM */
+/* Decimen audio — play / capture with burst + rolling-window decode */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
+
+  function rmsOf(buf) {
+    let s = 0;
+    for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+    return Math.sqrt(s / Math.max(1, buf.length));
+  }
 
   DA.AudioIO = {
     async ensureContext() {
@@ -16,12 +22,10 @@
       const ctx = await DA.AudioIO.ensureContext();
       await ctx.resume();
       const rate = sampleRate || ctx.sampleRate;
-      // Resample-friendly: always use context sampleRate buffer length at given rate
       const buffer = ctx.createBuffer(1, pcm.length, rate);
       const ch = buffer.getChannelData(0);
       const srcPcm = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
-      // Soft boost + clip for audible laptop speakers
-      const boost = opts.boost != null ? opts.boost : 2.2;
+      const boost = opts.boost != null ? opts.boost : 2.6;
       for (let i = 0; i < srcPcm.length; i++) {
         let x = srcPcm[i] * boost;
         ch[i] = x > 1 ? 1 : x < -1 ? -1 : x;
@@ -31,15 +35,17 @@
       const gain = ctx.createGain();
       gain.gain.value = opts.gain != null ? opts.gain : 1.0;
       src.connect(gain);
+      if (opts.loopDest) gain.connect(opts.loopDest);
 
       let analyser = null;
       if (opts.analyser || opts.onAnalyser) {
         analyser = ctx.createAnalyser();
         analyser.fftSize = 2048;
         gain.connect(analyser);
-        analyser.connect(ctx.destination);
+        if (!opts.silent) analyser.connect(ctx.destination);
+        else if (!opts.loopDest) analyser.connect(ctx.destination);
         if (opts.onAnalyser) opts.onAnalyser(analyser);
-      } else {
+      } else if (!opts.silent) {
         gain.connect(ctx.destination);
       }
 
@@ -52,7 +58,6 @@
           return;
         }
         DA._activeSource = src;
-        DA._activeGain = gain;
       });
     },
 
@@ -63,11 +68,15 @@
       DA._activeSource = null;
     },
 
+    async createLoopback() {
+      const ctx = await DA.AudioIO.ensureContext();
+      const dest = ctx.createMediaStreamDestination();
+      return { ctx, dest, stream: dest.stream };
+    },
+
     async openMic(constraints) {
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
-        throw new Error(
-          "הדפדפן לא מאפשר מיקרופון כאן. נסו Chrome דרך http://localhost או הפעילו הרשאות מיקרופון."
-        );
+        throw new Error("הדפדפן לא מאפשר מיקרופון כאן.");
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: Object.assign(
@@ -82,8 +91,17 @@
         video: false,
       });
       const ctx = await DA.AudioIO.ensureContext();
-      const source = ctx.createMediaStreamSource(stream);
-      return { stream, ctx, source };
+      return { stream, ctx, source: ctx.createMediaStreamSource(stream) };
+    },
+
+    async openStreamAsMic(mediaStream) {
+      const ctx = await DA.AudioIO.ensureContext();
+      return {
+        stream: mediaStream,
+        ctx,
+        source: ctx.createMediaStreamSource(mediaStream),
+        virtual: true,
+      };
     },
 
     async captureSeconds(seconds, onProgress) {
@@ -98,7 +116,6 @@
       source.connect(processor);
       processor.connect(mute);
       mute.connect(ctx.destination);
-
       await new Promise((resolve, reject) => {
         processor.onaudioprocess = (ev) => {
           if (offset >= total) return;
@@ -126,23 +143,28 @@
           } catch (_) {}
           stream.getTracks().forEach((tr) => tr.stop());
         }
-        DA._captureCleanup = cleanup;
       });
       return { pcm: pcm.subarray(0, offset), sampleRate };
     },
 
     /**
-     * Live listen loop with optional analyser for waveform UI.
+     * Listen with (1) energy-burst decode and (2) rolling 12s window decode.
+     * Frame duration is ~4–6s — window MUST be longer than one frame.
      */
     async startListenLoop(profile, onFrame, options) {
       options = options || {};
-      const windowSec = options.windowSec || 2.5;
-      const { stream, ctx, source } = await DA.AudioIO.openMic();
+      const opened = options.inputStream
+        ? await DA.AudioIO.openStreamAsMic(options.inputStream)
+        : await DA.AudioIO.openMic();
+      const { stream, ctx, source } = opened;
       const sampleRate = ctx.sampleRate;
-      const bufLen = Math.ceil(windowSec * sampleRate);
-      const ring = new Float32Array(bufLen);
+      const maxBurstSec = options.maxBurstSec || 14;
+      const maxBurst = Math.ceil(maxBurstSec * sampleRate);
+      const ringLen = Math.ceil((options.windowSec || 12) * sampleRate);
+      const ring = new Float32Array(ringLen);
       let writePos = 0;
       let filled = 0;
+
       const processor = ctx.createScriptProcessor(2048, 1, 1);
       const mute = ctx.createGain();
       mute.gain.value = 0;
@@ -153,44 +175,115 @@
       processor.connect(mute);
       mute.connect(ctx.destination);
       if (options.onAnalyser) options.onAnalyser(analyser);
-      let lastTry = 0;
+
       let stopped = false;
+      let inBurst = false;
+      let quietChunks = 0;
+      let burst = null;
+      let burstPos = 0;
+      let noiseFloor = 0.002;
+      let lastRoll = 0;
+      const seen = new Set();
+
+      function emit(result) {
+        if (!result || !result.frame) return;
+        const f = result.frame;
+        const key = f.sessionId + ":" + f.kind + ":" + f.seq + ":" + (result.bytes && result.bytes.length);
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (seen.size > 800) seen.clear();
+        onFrame(f, result);
+      }
+
+      function tryDecode(pcmSnap) {
+        try {
+          emit(
+            DA.Modem.decodePcm(pcmSnap, profile, sampleRate, {
+              maxBytes: options.maxBytes || 8192,
+            })
+          );
+        } catch (err) {
+          console.warn("decode", err);
+        }
+      }
+
+      function finishBurst() {
+        if (!burst || burstPos < sampleRate * 0.2) {
+          burst = null;
+          burstPos = 0;
+          inBurst = false;
+          return;
+        }
+        const snap = burst.subarray(0, burstPos);
+        const padded = new Float32Array(snap.length + Math.floor(sampleRate * 0.04));
+        padded.set(snap, Math.floor(sampleRate * 0.015));
+        tryDecode(padded);
+        burst = null;
+        burstPos = 0;
+        inBurst = false;
+      }
 
       processor.onaudioprocess = (ev) => {
         if (stopped) return;
         const input = ev.inputBuffer.getChannelData(0);
         for (let i = 0; i < input.length; i++) {
           ring[writePos] = input[i];
-          writePos = (writePos + 1) % bufLen;
-          if (filled < bufLen) filled++;
+          writePos = (writePos + 1) % ringLen;
+          if (filled < ringLen) filled++;
         }
+
+        const r = rmsOf(input);
+        if (!inBurst) noiseFloor = noiseFloor * 0.95 + r * 0.05;
+        const thresh = Math.max(0.008, noiseFloor * 4.5);
+
+        if (r > thresh) {
+          if (!inBurst) {
+            inBurst = true;
+            burst = new Float32Array(maxBurst);
+            burstPos = 0;
+            quietChunks = 0;
+          }
+          const n = Math.min(input.length, maxBurst - burstPos);
+          if (n > 0) {
+            burst.set(input.subarray(0, n), burstPos);
+            burstPos += n;
+          }
+          quietChunks = 0;
+          if (burstPos >= maxBurst) finishBurst();
+        } else if (inBurst) {
+          const n = Math.min(input.length, maxBurst - burstPos);
+          if (n > 0) {
+            burst.set(input.subarray(0, n), burstPos);
+            burstPos += n;
+          }
+          quietChunks++;
+          if (quietChunks >= 10) finishBurst();
+        }
+
         const now = performance.now();
-        if (now - lastTry < (options.intervalMs || 400)) return;
-        lastTry = now;
-        if (filled < sampleRate * 0.4) return;
-        const snap = new Float32Array(filled);
-        const start = (writePos - filled + bufLen) % bufLen;
-        for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % bufLen];
-        try {
-          const result = DA.Modem.decodePcm(snap, profile, sampleRate, { maxBytes: options.maxBytes || 8192 });
-          if (result && result.frame) onFrame(result.frame, result);
-        } catch (err) {
-          console.warn("decode", err);
+        if (now - lastRoll >= (options.intervalMs || 450) && filled > sampleRate * 1.5) {
+          lastRoll = now;
+          const snap = new Float32Array(filled);
+          const start = (writePos - filled + ringLen) % ringLen;
+          for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % ringLen];
+          tryDecode(snap);
         }
       };
 
       return {
         sampleRate,
         analyser,
+        virtual: !!opened.virtual,
         stop() {
           stopped = true;
+          if (inBurst) finishBurst();
           try {
             processor.disconnect();
             source.disconnect();
             mute.disconnect();
             analyser.disconnect();
           } catch (_) {}
-          stream.getTracks().forEach((tr) => tr.stop());
+          if (!opened.virtual) stream.getTracks().forEach((tr) => tr.stop());
         },
       };
     },

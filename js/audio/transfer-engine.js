@@ -11,7 +11,6 @@
       const split = DA.splitBlocks(containerBytes, blockLen);
       const sessionId = (options.sessionId != null ? options.sessionId : (Math.random() * 0xffff) | 1) & 0xffff;
       const mode = options.mode || "SOUNDONLY";
-      const received = new Array(split.k).fill(null);
       let priority = null; // missing list from NACK
 
       // Channel assignment for COMBINE: even → sound, odd → camera (or by range)
@@ -29,7 +28,7 @@
         blockLen: split.blockLen,
         totalLen: split.totalLen,
         blocks: split.blocks,
-        received,
+        received: new Array(split.k).fill(null),
         profile: options.profile || DA.resolveBandProfile(options.bandOverride),
         bandOverride: options.bandOverride || "auto",
 
@@ -43,22 +42,22 @@
 
         missing() {
           const m = [];
-          for (let i = 0; i < this.k; i++) if (!received[i]) m.push(i);
+          for (let i = 0; i < this.k; i++) if (!this.received[i]) m.push(i);
           return m;
         },
 
         solvedCount() {
           let n = 0;
-          for (let i = 0; i < this.k; i++) if (received[i]) n++;
+          for (let i = 0; i < this.k; i++) if (this.received[i]) n++;
           return n;
         },
 
         acceptBlock(seq, payload) {
           if (seq < 0 || seq >= this.k) return false;
-          if (received[seq]) return false;
+          if (this.received[seq]) return false;
           const buf = new Uint8Array(this.blockLen);
           buf.set(payload.subarray(0, Math.min(payload.length, this.blockLen)));
-          received[seq] = buf;
+          this.received[seq] = buf;
           if (priority) {
             priority = priority.filter((x) => x !== seq);
             if (!priority.length) priority = null;
@@ -72,7 +71,7 @@
           for (let i = 0; i < this.k; i++) {
             const start = i * this.blockLen;
             const take = Math.min(this.blockLen, this.totalLen - start);
-            out.set(received[i].subarray(0, take), start);
+            out.set(this.received[i].subarray(0, take), start);
           }
           return out;
         },

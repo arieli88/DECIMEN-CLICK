@@ -1,4 +1,4 @@
-/* Decimen audio ALL-IN-ONE bundle for file:// */
+/* Decimen audio ALL-IN-ONE bundle */
 /* ---- crc32.js ---- */
 /* Decimen audio — CRC-32 (IEEE) */
 (function (g) {
@@ -82,27 +82,28 @@
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
 /* ---- band-select.js ---- */
-/* Decimen audio — device band profiles + auto-detect */
+/* Decimen audio — band profiles: enough parallel bits, wide Hz gaps */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
+  // 12 carriers = 6 bit/symbol. Keep Hz step ≥ ~400 Hz for Goertzel.
   DA.BAND_PROFILES = {
     laptop: {
       id: "laptop",
       label: "Laptop",
-      fMin: 1800,
-      fMax: 5500,
+      fMin: 1500,
+      fMax: 6000,
       carriers: 12,
-      symbolMs: 28,
+      symbolMs: 36,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
       label: "Phone",
-      fMin: 2000,
-      fMax: 7500,
-      carriers: 16,
-      symbolMs: 22,
+      fMin: 1700,
+      fMax: 7200,
+      carriers: 12,
+      symbolMs: 32,
       bitsPerCarrier: 1,
     },
   };
@@ -110,9 +111,6 @@
   function uaLooksPhone() {
     const ua = navigator.userAgent || "";
     if (/Android|iPhone|iPad|iPod|Mobile/i.test(ua)) return true;
-    if (navigator.userAgentData && Array.isArray(navigator.userAgentData.mobile)) {
-      /* unused */
-    }
     if (navigator.userAgentData && navigator.userAgentData.mobile) return true;
     if ((navigator.maxTouchPoints || 0) > 1 && Math.min(screen.width, screen.height) < 900) return true;
     return false;
@@ -124,11 +122,9 @@
 
   DA.resolveBandProfile = function resolveBandProfile(override) {
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    const kind = DA.detectDeviceKind();
-    return DA.BAND_PROFILES[kind];
+    return DA.BAND_PROFILES[DA.detectDeviceKind()];
   };
 
-  /** Build evenly spaced carrier frequencies for a profile. */
   DA.carrierFreqs = function carrierFreqs(profile) {
     const n = profile.carriers;
     const freqs = new Float64Array(n);
@@ -451,22 +447,49 @@
 
       let bestOff = -1;
       let bestScore = -Infinity;
-      const scanStep = Math.max(1, Math.floor(symbolSamples / 12));
-      const maxScan = Math.min(Math.max(0, pcm.length - symbolSamples * (PREAMBLE_BITS.length + 10)), sampleRate * 5);
-      for (let off = 0; off < maxScan; off += scanStep) {
-        let score = 0;
-        for (let p = 0; p < PREAMBLE_BITS.length; p++) {
-          const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
-          if (bits[0] === PREAMBLE_BITS[p]) score++;
-          else score--;
-          if (pairs > 1) {
-            if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+      const coarse = Math.max(24, Math.floor(symbolSamples / 2));
+      // Search start of buffer and last ~7s (frame may sit at end of rolling window)
+      const regions = [[0, Math.min(pcm.length, Math.floor(sampleRate * 3))]];
+      if (pcm.length > sampleRate * 4) {
+        regions.push([Math.max(0, pcm.length - Math.floor(sampleRate * 7)), pcm.length]);
+      }
+      for (const [r0, r1] of regions) {
+        const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));
+        for (let off = r0; off < limit; off += coarse) {
+          let score = 0;
+          for (let p = 0; p < PREAMBLE_BITS.length; p++) {
+            const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
+            if (bits[0] === PREAMBLE_BITS[p]) score++;
             else score--;
+            if (pairs > 1) {
+              if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+              else score--;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestOff = off;
           }
         }
-        if (score > bestScore) {
-          bestScore = score;
-          bestOff = off;
+      }
+      if (bestOff >= 0) {
+        const lo = Math.max(0, bestOff - coarse);
+        const hi = bestOff + coarse;
+        for (let off = lo; off <= hi; off += Math.max(4, Math.floor(coarse / 6))) {
+          let score = 0;
+          for (let p = 0; p < PREAMBLE_BITS.length; p++) {
+            const bits = readSymbolBits(pcm, off + p * symbolSamples, symbolSamples, freqs, pairs, sampleRate);
+            if (bits[0] === PREAMBLE_BITS[p]) score++;
+            else score--;
+            if (pairs > 1) {
+              if (bits[1] === 1 - PREAMBLE_BITS[p]) score++;
+              else score--;
+            }
+          }
+          if (score > bestScore) {
+            bestScore = score;
+            bestOff = off;
+          }
         }
       }
       const needScore = PREAMBLE_BITS.length * (pairs > 1 ? 1.2 : 0.6);
@@ -514,9 +537,15 @@
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
 /* ---- player-capture.js ---- */
-/* Decimen audio — play PCM / capture mic to PCM */
+/* Decimen audio — play / capture with burst + rolling-window decode */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
+
+  function rmsOf(buf) {
+    let s = 0;
+    for (let i = 0; i < buf.length; i++) s += buf[i] * buf[i];
+    return Math.sqrt(s / Math.max(1, buf.length));
+  }
 
   DA.AudioIO = {
     async ensureContext() {
@@ -532,12 +561,10 @@
       const ctx = await DA.AudioIO.ensureContext();
       await ctx.resume();
       const rate = sampleRate || ctx.sampleRate;
-      // Resample-friendly: always use context sampleRate buffer length at given rate
       const buffer = ctx.createBuffer(1, pcm.length, rate);
       const ch = buffer.getChannelData(0);
       const srcPcm = pcm instanceof Float32Array ? pcm : Float32Array.from(pcm);
-      // Soft boost + clip for audible laptop speakers
-      const boost = opts.boost != null ? opts.boost : 2.2;
+      const boost = opts.boost != null ? opts.boost : 2.6;
       for (let i = 0; i < srcPcm.length; i++) {
         let x = srcPcm[i] * boost;
         ch[i] = x > 1 ? 1 : x < -1 ? -1 : x;
@@ -547,15 +574,17 @@
       const gain = ctx.createGain();
       gain.gain.value = opts.gain != null ? opts.gain : 1.0;
       src.connect(gain);
+      if (opts.loopDest) gain.connect(opts.loopDest);
 
       let analyser = null;
       if (opts.analyser || opts.onAnalyser) {
         analyser = ctx.createAnalyser();
         analyser.fftSize = 2048;
         gain.connect(analyser);
-        analyser.connect(ctx.destination);
+        if (!opts.silent) analyser.connect(ctx.destination);
+        else if (!opts.loopDest) analyser.connect(ctx.destination);
         if (opts.onAnalyser) opts.onAnalyser(analyser);
-      } else {
+      } else if (!opts.silent) {
         gain.connect(ctx.destination);
       }
 
@@ -568,7 +597,6 @@
           return;
         }
         DA._activeSource = src;
-        DA._activeGain = gain;
       });
     },
 
@@ -579,11 +607,15 @@
       DA._activeSource = null;
     },
 
+    async createLoopback() {
+      const ctx = await DA.AudioIO.ensureContext();
+      const dest = ctx.createMediaStreamDestination();
+      return { ctx, dest, stream: dest.stream };
+    },
+
     async openMic(constraints) {
       if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
-        throw new Error(
-          "הדפדפן לא מאפשר מיקרופון כאן. נסו Chrome דרך http://localhost או הפעילו הרשאות מיקרופון."
-        );
+        throw new Error("הדפדפן לא מאפשר מיקרופון כאן.");
       }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: Object.assign(
@@ -598,8 +630,17 @@
         video: false,
       });
       const ctx = await DA.AudioIO.ensureContext();
-      const source = ctx.createMediaStreamSource(stream);
-      return { stream, ctx, source };
+      return { stream, ctx, source: ctx.createMediaStreamSource(stream) };
+    },
+
+    async openStreamAsMic(mediaStream) {
+      const ctx = await DA.AudioIO.ensureContext();
+      return {
+        stream: mediaStream,
+        ctx,
+        source: ctx.createMediaStreamSource(mediaStream),
+        virtual: true,
+      };
     },
 
     async captureSeconds(seconds, onProgress) {
@@ -614,7 +655,6 @@
       source.connect(processor);
       processor.connect(mute);
       mute.connect(ctx.destination);
-
       await new Promise((resolve, reject) => {
         processor.onaudioprocess = (ev) => {
           if (offset >= total) return;
@@ -642,23 +682,28 @@
           } catch (_) {}
           stream.getTracks().forEach((tr) => tr.stop());
         }
-        DA._captureCleanup = cleanup;
       });
       return { pcm: pcm.subarray(0, offset), sampleRate };
     },
 
     /**
-     * Live listen loop with optional analyser for waveform UI.
+     * Listen with (1) energy-burst decode and (2) rolling 12s window decode.
+     * Frame duration is ~4–6s — window MUST be longer than one frame.
      */
     async startListenLoop(profile, onFrame, options) {
       options = options || {};
-      const windowSec = options.windowSec || 2.5;
-      const { stream, ctx, source } = await DA.AudioIO.openMic();
+      const opened = options.inputStream
+        ? await DA.AudioIO.openStreamAsMic(options.inputStream)
+        : await DA.AudioIO.openMic();
+      const { stream, ctx, source } = opened;
       const sampleRate = ctx.sampleRate;
-      const bufLen = Math.ceil(windowSec * sampleRate);
-      const ring = new Float32Array(bufLen);
+      const maxBurstSec = options.maxBurstSec || 14;
+      const maxBurst = Math.ceil(maxBurstSec * sampleRate);
+      const ringLen = Math.ceil((options.windowSec || 12) * sampleRate);
+      const ring = new Float32Array(ringLen);
       let writePos = 0;
       let filled = 0;
+
       const processor = ctx.createScriptProcessor(2048, 1, 1);
       const mute = ctx.createGain();
       mute.gain.value = 0;
@@ -669,44 +714,115 @@
       processor.connect(mute);
       mute.connect(ctx.destination);
       if (options.onAnalyser) options.onAnalyser(analyser);
-      let lastTry = 0;
+
       let stopped = false;
+      let inBurst = false;
+      let quietChunks = 0;
+      let burst = null;
+      let burstPos = 0;
+      let noiseFloor = 0.002;
+      let lastRoll = 0;
+      const seen = new Set();
+
+      function emit(result) {
+        if (!result || !result.frame) return;
+        const f = result.frame;
+        const key = f.sessionId + ":" + f.kind + ":" + f.seq + ":" + (result.bytes && result.bytes.length);
+        if (seen.has(key)) return;
+        seen.add(key);
+        if (seen.size > 800) seen.clear();
+        onFrame(f, result);
+      }
+
+      function tryDecode(pcmSnap) {
+        try {
+          emit(
+            DA.Modem.decodePcm(pcmSnap, profile, sampleRate, {
+              maxBytes: options.maxBytes || 8192,
+            })
+          );
+        } catch (err) {
+          console.warn("decode", err);
+        }
+      }
+
+      function finishBurst() {
+        if (!burst || burstPos < sampleRate * 0.2) {
+          burst = null;
+          burstPos = 0;
+          inBurst = false;
+          return;
+        }
+        const snap = burst.subarray(0, burstPos);
+        const padded = new Float32Array(snap.length + Math.floor(sampleRate * 0.04));
+        padded.set(snap, Math.floor(sampleRate * 0.015));
+        tryDecode(padded);
+        burst = null;
+        burstPos = 0;
+        inBurst = false;
+      }
 
       processor.onaudioprocess = (ev) => {
         if (stopped) return;
         const input = ev.inputBuffer.getChannelData(0);
         for (let i = 0; i < input.length; i++) {
           ring[writePos] = input[i];
-          writePos = (writePos + 1) % bufLen;
-          if (filled < bufLen) filled++;
+          writePos = (writePos + 1) % ringLen;
+          if (filled < ringLen) filled++;
         }
+
+        const r = rmsOf(input);
+        if (!inBurst) noiseFloor = noiseFloor * 0.95 + r * 0.05;
+        const thresh = Math.max(0.008, noiseFloor * 4.5);
+
+        if (r > thresh) {
+          if (!inBurst) {
+            inBurst = true;
+            burst = new Float32Array(maxBurst);
+            burstPos = 0;
+            quietChunks = 0;
+          }
+          const n = Math.min(input.length, maxBurst - burstPos);
+          if (n > 0) {
+            burst.set(input.subarray(0, n), burstPos);
+            burstPos += n;
+          }
+          quietChunks = 0;
+          if (burstPos >= maxBurst) finishBurst();
+        } else if (inBurst) {
+          const n = Math.min(input.length, maxBurst - burstPos);
+          if (n > 0) {
+            burst.set(input.subarray(0, n), burstPos);
+            burstPos += n;
+          }
+          quietChunks++;
+          if (quietChunks >= 10) finishBurst();
+        }
+
         const now = performance.now();
-        if (now - lastTry < (options.intervalMs || 400)) return;
-        lastTry = now;
-        if (filled < sampleRate * 0.4) return;
-        const snap = new Float32Array(filled);
-        const start = (writePos - filled + bufLen) % bufLen;
-        for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % bufLen];
-        try {
-          const result = DA.Modem.decodePcm(snap, profile, sampleRate, { maxBytes: options.maxBytes || 8192 });
-          if (result && result.frame) onFrame(result.frame, result);
-        } catch (err) {
-          console.warn("decode", err);
+        if (now - lastRoll >= (options.intervalMs || 450) && filled > sampleRate * 1.5) {
+          lastRoll = now;
+          const snap = new Float32Array(filled);
+          const start = (writePos - filled + ringLen) % ringLen;
+          for (let i = 0; i < filled; i++) snap[i] = ring[(start + i) % ringLen];
+          tryDecode(snap);
         }
       };
 
       return {
         sampleRate,
         analyser,
+        virtual: !!opened.virtual,
         stop() {
           stopped = true;
+          if (inBurst) finishBurst();
           try {
             processor.disconnect();
             source.disconnect();
             mute.disconnect();
             analyser.disconnect();
           } catch (_) {}
-          stream.getTracks().forEach((tr) => tr.stop());
+          if (!opened.virtual) stream.getTracks().forEach((tr) => tr.stop());
         },
       };
     },
@@ -1032,7 +1148,6 @@
       const split = DA.splitBlocks(containerBytes, blockLen);
       const sessionId = (options.sessionId != null ? options.sessionId : (Math.random() * 0xffff) | 1) & 0xffff;
       const mode = options.mode || "SOUNDONLY";
-      const received = new Array(split.k).fill(null);
       let priority = null; // missing list from NACK
 
       // Channel assignment for COMBINE: even → sound, odd → camera (or by range)
@@ -1050,7 +1165,7 @@
         blockLen: split.blockLen,
         totalLen: split.totalLen,
         blocks: split.blocks,
-        received,
+        received: new Array(split.k).fill(null),
         profile: options.profile || DA.resolveBandProfile(options.bandOverride),
         bandOverride: options.bandOverride || "auto",
 
@@ -1064,22 +1179,22 @@
 
         missing() {
           const m = [];
-          for (let i = 0; i < this.k; i++) if (!received[i]) m.push(i);
+          for (let i = 0; i < this.k; i++) if (!this.received[i]) m.push(i);
           return m;
         },
 
         solvedCount() {
           let n = 0;
-          for (let i = 0; i < this.k; i++) if (received[i]) n++;
+          for (let i = 0; i < this.k; i++) if (this.received[i]) n++;
           return n;
         },
 
         acceptBlock(seq, payload) {
           if (seq < 0 || seq >= this.k) return false;
-          if (received[seq]) return false;
+          if (this.received[seq]) return false;
           const buf = new Uint8Array(this.blockLen);
           buf.set(payload.subarray(0, Math.min(payload.length, this.blockLen)));
-          received[seq] = buf;
+          this.received[seq] = buf;
           if (priority) {
             priority = priority.filter((x) => x !== seq);
             if (!priority.length) priority = null;
@@ -1093,7 +1208,7 @@
           for (let i = 0; i < this.k; i++) {
             const start = i * this.blockLen;
             const take = Math.min(this.blockLen, this.totalLen - start);
-            out.set(received[i].subarray(0, take), start);
+            out.set(this.received[i].subarray(0, take), start);
           }
           return out;
         },
@@ -1197,6 +1312,142 @@
         channelFor,
       };
     },
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);
+
+/* ---- selftest.js ---- */
+/* In-browser SOUNDONLY self-test — offline encode/decode of each frame (fast) */
+(function (g) {
+  const DA = (g.DecimenAudio = g.DecimenAudio || {});
+
+  DA.runSoundOnlySelfTest = async function runSoundOnlySelfTest(opts) {
+    opts = opts || {};
+    const text = opts.text || "SOUNDONLY-SELFTEST-" + Date.now();
+    const raw = new TextEncoder().encode(text);
+    const container = await DA.buildContainer("selftest.txt", "text/plain", raw);
+    const base = DA.resolveBandProfile(opts.band || null);
+    const profile = Object.assign({}, base);
+    const sampleRate = 48000;
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: 28,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+
+    const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: tx.blockLen,
+      sessionId: tx.sessionId,
+    });
+    rx.k = tx.k;
+    rx.blockLen = tx.blockLen;
+    rx.totalLen = tx.totalLen;
+    rx.received = new Array(tx.k).fill(null);
+
+    function roundTrip(bytes, noiseAmp) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      // pad silence like mic buffer edges
+      const padded = new Float32Array(pcm.length + Math.floor(sampleRate * 0.08));
+      padded.set(pcm, Math.floor(sampleRate * 0.03));
+      if (noiseAmp) {
+        for (let i = 0; i < padded.length; i++) padded[i] += (Math.random() - 0.5) * noiseAmp;
+      }
+      return DA.Modem.decodePcm(padded, profile, sampleRate, { maxBytes: 8192 });
+    }
+
+    // META
+    const metaDec = roundTrip(tx.packMetaFrame({ name: "selftest.txt", bandId: profile.id }), 0.01);
+    if (!metaDec || !metaDec.frame || metaDec.frame.kind !== DA.FRAME_META) {
+      return { ok: false, message: "Self-test FAIL: META frame not recovered" };
+    }
+
+    let fails = 0;
+    for (let seq = 0; seq < tx.k; seq++) {
+      const bytes = tx.packDataFrame(seq);
+      let got = null;
+      // up to 3 attempts with light noise (simulates acoustic)
+      for (let attempt = 0; attempt < 3 && !got; attempt++) {
+        const d = roundTrip(bytes, 0.012 + attempt * 0.004);
+        if (d && d.frame && d.frame.kind === DA.FRAME_DATA && d.frame.seq === seq) {
+          got = d.frame;
+        }
+      }
+      if (!got) {
+        fails++;
+        continue;
+      }
+      rx.acceptBlock(got.seq, got.payload);
+    }
+
+    if (rx.solvedCount() < rx.k) {
+      return {
+        ok: false,
+        message: "Self-test FAIL: " + rx.solvedCount() + "/" + rx.k + " (frameFails=" + fails + ")",
+        solved: rx.solvedCount(),
+        k: tx.k,
+      };
+    }
+    const parsed = await DA.parseContainer(rx.assemble());
+    const gotText = new TextDecoder().decode(parsed.payload);
+    if (gotText !== text) {
+      return { ok: false, message: "Self-test FAIL: payload mismatch" };
+    }
+    return {
+      ok: true,
+      message: "Self-test PASS · \"" + text.slice(0, 28) + "\" · " + tx.k + " blocks",
+      recovered: gotText,
+      k: tx.k,
+    };
+  };
+
+  /** Full SOUNDONLY file transfer offline (encode all blocks → decode → assemble). */
+  DA.transferSoundOnlyOffline = async function transferSoundOnlyOffline(fileBytes, fileName, mime) {
+    const container = await DA.buildContainer(fileName || "file.bin", mime || "application/octet-stream", fileBytes);
+    const profile = DA.resolveBandProfile(null);
+    const sampleRate = 48000;
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: 28,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+    const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: tx.blockLen,
+      sessionId: tx.sessionId,
+    });
+    rx.k = tx.k;
+    rx.blockLen = tx.blockLen;
+    rx.totalLen = tx.totalLen;
+    rx.received = new Array(tx.k).fill(null);
+
+    function send(bytes) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      const padded = new Float32Array(pcm.length + Math.floor(sampleRate * 0.1));
+      padded.set(pcm, Math.floor(sampleRate * 0.04));
+      for (let i = 0; i < padded.length; i++) padded[i] += (Math.random() - 0.5) * 0.008;
+      return DA.Modem.decodePcm(padded, profile, sampleRate, { maxBytes: 8192 });
+    }
+
+    send(tx.packMetaFrame({ name: fileName || "file.bin", bandId: profile.id }));
+    for (let seq = 0; seq < tx.k; seq++) {
+      let ok = false;
+      for (let a = 0; a < 5 && !ok; a++) {
+        const d = send(tx.packDataFrame(seq));
+        if (d && d.frame && d.frame.kind === DA.FRAME_DATA && d.frame.sessionId === tx.sessionId) {
+          rx.acceptBlock(d.frame.seq, d.frame.payload);
+          ok = rx.received[seq] != null;
+        }
+      }
+      if (!ok) {
+        return { ok: false, message: "block " + seq + " lost", solved: rx.solvedCount(), k: tx.k };
+      }
+    }
+    const parsed = await DA.parseContainer(rx.assemble());
+    return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
@@ -1330,12 +1581,18 @@
       viz.setMode("tx");
       viz.showPcm(pcm);
     }
-    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, {
-      boost: 2.4,
+    const opts = {
+      boost: 2.8,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
-    });
+    };
+    if (state.loopback && state.loopback.dest) {
+      opts.loopDest = state.loopback.dest;
+    }
+    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, opts);
+    // Quiet gap so RX burst detector can separate frames
+    await new Promise((r) => setTimeout(r, 400));
   }
 
   async function startNackListen() {
@@ -1440,10 +1697,12 @@
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
       await playFrameBytes(bytes);
+      // repeat once for acoustic robustness
+      await playFrameBytes(bytes);
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 40);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 50);
   }
 
   function cameraTxLoop() {
@@ -1473,7 +1732,7 @@
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      blockLen: state.mode === "SOUNDONLY" ? 40 : 64,
+      blockLen: state.mode === "SOUNDONLY" ? 32 : 48,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -1600,6 +1859,22 @@
           const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String(err.message || err);
           setStatus(mapped, true);
           if (window.__decimenLog) window.__decimenLog("Speaker test FAIL: " + mapped, true);
+        }
+      });
+
+    $("audio-selftest") &&
+      $("audio-selftest").addEventListener("click", async () => {
+        try {
+          setStatus("רץ Self-test (loopback וירטואלי)…");
+          if (!DA.runSoundOnlySelfTest) throw new Error("selftest module missing");
+          const result = await DA.runSoundOnlySelfTest({});
+          setStatus(result.message, !result.ok);
+          if (window.__decimenLog) window.__decimenLog(result.message, !result.ok);
+          if (!result.ok) throw new Error(result.message);
+        } catch (err) {
+          const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String(err.message || err);
+          setStatus(mapped, true);
+          if (window.__decimenLog) window.__decimenLog("Self-test error: " + mapped, true);
         }
       });
 
@@ -2080,4 +2355,4 @@
   DA.ReceiverBridge = { state, speakNack, stopListen, applyModeUi };
 })();
 
-try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO); if (!window.__DECIMEN_AUDIO_BUNDLE_OK) window.__DECIMEN_AUDIO_BUNDLE_ERR = new Error("DecimenAudio incomplete after bundle"); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }
+try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.runSoundOnlySelfTest && window.DecimenAudio.transferSoundOnlyOffline); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }

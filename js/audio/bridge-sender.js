@@ -127,12 +127,18 @@
       viz.setMode("tx");
       viz.showPcm(pcm);
     }
-    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, {
-      boost: 2.4,
+    const opts = {
+      boost: 2.8,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
-    });
+    };
+    if (state.loopback && state.loopback.dest) {
+      opts.loopDest = state.loopback.dest;
+    }
+    await DA.AudioIO.playPcm(pcm, ctx.sampleRate, opts);
+    // Quiet gap so RX burst detector can separate frames
+    await new Promise((r) => setTimeout(r, 400));
   }
 
   async function startNackListen() {
@@ -237,10 +243,12 @@
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
       await playFrameBytes(bytes);
+      // repeat once for acoustic robustness
+      await playFrameBytes(bytes);
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 40);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 50);
   }
 
   function cameraTxLoop() {
@@ -270,7 +278,7 @@
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      blockLen: state.mode === "SOUNDONLY" ? 40 : 64,
+      blockLen: state.mode === "SOUNDONLY" ? 32 : 48,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -397,6 +405,22 @@
           const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String(err.message || err);
           setStatus(mapped, true);
           if (window.__decimenLog) window.__decimenLog("Speaker test FAIL: " + mapped, true);
+        }
+      });
+
+    $("audio-selftest") &&
+      $("audio-selftest").addEventListener("click", async () => {
+        try {
+          setStatus("רץ Self-test (loopback וירטואלי)…");
+          if (!DA.runSoundOnlySelfTest) throw new Error("selftest module missing");
+          const result = await DA.runSoundOnlySelfTest({});
+          setStatus(result.message, !result.ok);
+          if (window.__decimenLog) window.__decimenLog(result.message, !result.ok);
+          if (!result.ok) throw new Error(result.message);
+        } catch (err) {
+          const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String(err.message || err);
+          setStatus(mapped, true);
+          if (window.__decimenLog) window.__decimenLog("Self-test error: " + mapped, true);
         }
       });
 
