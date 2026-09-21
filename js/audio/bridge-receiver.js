@@ -202,19 +202,12 @@
           const bandId = new TextDecoder().decode(p.subarray(1, 1 + bandLen));
           if (DA.BAND_PROFILES[bandId]) {
             s.profile = DA.BAND_PROFILES[bandId];
-            $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
-            // restart listen on matching band
-            if (state.listen) {
-              state.listen.stop();
-              state.listen = null;
+            $("audio-band-label-rx") &&
+              ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
+            // Retune in-place — NEVER stop/restart mic (phones drop all following blocks).
+            if (state.listen && typeof state.listen.setProfile === "function") {
+              state.listen.setProfile(s.profile);
             }
-            DA.AudioIO.startListenLoop(s.profile, onFrame, {
-              windowSec: 12,
-              maxBurstSec: 14,
-              maxBytes: 8192,
-            }).then((l) => {
-              state.listen = l;
-            });
           }
         }
       } catch (_) {}
@@ -252,7 +245,10 @@
   async function startSoundListen() {
     assertMicAvailable();
     setStatus("מבקש הרשאת מיקרופון…");
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
+      mode: state.mode,
+      preferShared: true,
+    });
     if (state.session) state.session.profile = profile;
     $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = DA.bandLabel(profile, state.bandOverride === "auto"));
     if (state.listen) {
@@ -268,8 +264,8 @@
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
     state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 12,
-      maxBurstSec: 14,
+      windowSec: 14,
+      maxBurstSec: 16,
       maxBytes: 8192,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);

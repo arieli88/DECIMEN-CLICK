@@ -43,7 +43,7 @@ function addNoise(pcm, amp) {
 (async () => {
   const payload = new TextEncoder().encode("HELLO-SOUNDONLY-" + "x".repeat(200));
   const container = await DA.buildContainer("test.txt", "text/plain", payload);
-  const profile = DA.BAND_PROFILES.laptop;
+  const profile = DA.BAND_PROFILES.shared || DA.BAND_PROFILES.laptop;
   const sampleRate = 48000;
   const session = DA.TransferEngine.createSession(container, {
     mode: "SOUNDONLY",

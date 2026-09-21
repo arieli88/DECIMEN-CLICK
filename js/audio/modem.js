@@ -136,7 +136,9 @@
         ]);
       }
       for (const [r0, r1] of regions) {
-        const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));
+        // Offsets may sit early; frame body can extend past the search window into pcm.
+        const absLimit = Math.max(0, pcm.length - symbolSamples * (PREAMBLE_BITS.length + 10));
+        const limit = Math.min(absLimit, r1);
         for (let off = r0; off < limit; off += coarse) {
           let score = 0;
           for (let p = 0; p < PREAMBLE_BITS.length; p++) {

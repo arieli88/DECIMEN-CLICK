@@ -154,19 +154,21 @@
      */
     async startListenLoop(profile, onFrame, options) {
       options = options || {};
+      // Mutable holder so META can retune without stopping the mic (stopping drops blocks on phones).
+      const profileRef = { current: profile };
       const opened = options.inputStream
         ? await DA.AudioIO.openStreamAsMic(options.inputStream)
         : await DA.AudioIO.openMic();
       const { stream, ctx, source } = opened;
       const sampleRate = ctx.sampleRate;
-      const maxBurstSec = options.maxBurstSec || 14;
+      const maxBurstSec = options.maxBurstSec || 16;
       const maxBurst = Math.ceil(maxBurstSec * sampleRate);
-      const ringLen = Math.ceil((options.windowSec || 12) * sampleRate);
+      const ringLen = Math.ceil((options.windowSec || 14) * sampleRate);
       const ring = new Float32Array(ringLen);
       let writePos = 0;
       let filled = 0;
 
-      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
       const mute = ctx.createGain();
       mute.gain.value = 0;
       const analyser = ctx.createAnalyser();
@@ -224,7 +226,7 @@
         decoding = true;
         try {
           emit(
-            DA.Modem.decodePcm(snap, profile, sampleRate, {
+            DA.Modem.decodePcm(snap, profileRef.current, sampleRate, {
               maxBytes: options.maxBytes || 8192,
               searchSec: options.searchSec || 1.2,
             })
@@ -290,8 +292,8 @@
             burstPos += n;
           }
           quietChunks++;
-          // ~0.5s quiet at 2048/48k — end of frame
-          if (quietChunks >= 12) finishBurst();
+    // Quiet longer for phone burst detector (4096 buffers ≈ 85ms/chunk)
+          if (quietChunks >= 14) finishBurst();
         }
 
         const now = performance.now();
@@ -316,6 +318,10 @@
         sampleRate,
         analyser,
         virtual: !!opened.virtual,
+        profileRef,
+        setProfile(p) {
+          if (p) profileRef.current = p;
+        },
         stop() {
           stopped = true;
           if (inBurst) finishBurst();
@@ -324,8 +330,9 @@
             const snap = decodeQueue.shift();
             try {
               emit(
-                DA.Modem.decodePcm(snap, profile, sampleRate, {
+                DA.Modem.decodePcm(snap, profileRef.current, sampleRate, {
                   maxBytes: options.maxBytes || 8192,
+                  searchSec: options.searchSec || 1.2,
                 })
               );
             } catch (_) {}

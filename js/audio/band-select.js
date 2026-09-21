@@ -1,25 +1,35 @@
-/* Decimen audio — band profiles: enough parallel bits, wide Hz gaps */
+/* Decimen audio — band profiles tuned for phone mic/speaker (slow + mid-band) */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
-  // 12 carriers = 6 bit/symbol. Keep Hz step ≥ ~400 Hz for Goertzel.
+  // Shared acoustic profile: both laptop and phone MUST use the same for SOUNDONLY.
+  // Fewer carriers, lower fMax (phone mics roll off above ~5 kHz), longer symbols.
   DA.BAND_PROFILES = {
+    shared: {
+      id: "shared",
+      label: "Shared (phone-safe)",
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8, // 4 bit/symbol — slower but robust
+      symbolMs: 56,
+      bitsPerCarrier: 1,
+    },
     laptop: {
       id: "laptop",
       label: "Laptop",
-      fMin: 1500,
-      fMax: 6000,
-      carriers: 12,
-      symbolMs: 36,
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8,
+      symbolMs: 52,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
       label: "Phone",
-      fMin: 1700,
-      fMax: 7200,
-      carriers: 12,
-      symbolMs: 32,
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8,
+      symbolMs: 60,
       bitsPerCarrier: 1,
     },
   };
@@ -36,9 +46,15 @@
     return uaLooksPhone() ? "phone" : "laptop";
   };
 
-  DA.resolveBandProfile = function resolveBandProfile(override) {
+  /**
+   * For SOUNDONLY always prefer shared profile so TX/RX match across devices.
+   * Override still honored when user picks laptop/phone explicitly.
+   */
+  DA.resolveBandProfile = function resolveBandProfile(override, opts) {
+    opts = opts || {};
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    return DA.BAND_PROFILES[DA.detectDeviceKind()];
+    if (opts.mode === "SOUNDONLY" || opts.preferShared) return DA.BAND_PROFILES.shared;
+    return DA.BAND_PROFILES.shared; // default: shared (was device-split; mismatched bands broke phones)
   };
 
   DA.carrierFreqs = function carrierFreqs(profile) {
@@ -54,6 +70,6 @@
   };
 
   DA.bandLabel = function bandLabel(profile, auto) {
-    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz";
+    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz · " + profile.symbolMs + "ms";
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);

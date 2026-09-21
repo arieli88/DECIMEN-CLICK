@@ -10571,28 +10571,38 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
 /* ---- band-select.js ---- */
-/* Decimen audio — band profiles: enough parallel bits, wide Hz gaps */
+/* Decimen audio — band profiles tuned for phone mic/speaker (slow + mid-band) */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
-  // 12 carriers = 6 bit/symbol. Keep Hz step ≥ ~400 Hz for Goertzel.
+  // Shared acoustic profile: both laptop and phone MUST use the same for SOUNDONLY.
+  // Fewer carriers, lower fMax (phone mics roll off above ~5 kHz), longer symbols.
   DA.BAND_PROFILES = {
+    shared: {
+      id: "shared",
+      label: "Shared (phone-safe)",
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8, // 4 bit/symbol — slower but robust
+      symbolMs: 56,
+      bitsPerCarrier: 1,
+    },
     laptop: {
       id: "laptop",
       label: "Laptop",
-      fMin: 1500,
-      fMax: 6000,
-      carriers: 12,
-      symbolMs: 36,
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8,
+      symbolMs: 52,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
       label: "Phone",
-      fMin: 1700,
-      fMax: 7200,
-      carriers: 12,
-      symbolMs: 32,
+      fMin: 1400,
+      fMax: 4800,
+      carriers: 8,
+      symbolMs: 60,
       bitsPerCarrier: 1,
     },
   };
@@ -10609,9 +10619,15 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
     return uaLooksPhone() ? "phone" : "laptop";
   };
 
-  DA.resolveBandProfile = function resolveBandProfile(override) {
+  /**
+   * For SOUNDONLY always prefer shared profile so TX/RX match across devices.
+   * Override still honored when user picks laptop/phone explicitly.
+   */
+  DA.resolveBandProfile = function resolveBandProfile(override, opts) {
+    opts = opts || {};
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    return DA.BAND_PROFILES[DA.detectDeviceKind()];
+    if (opts.mode === "SOUNDONLY" || opts.preferShared) return DA.BAND_PROFILES.shared;
+    return DA.BAND_PROFILES.shared; // default: shared (was device-split; mismatched bands broke phones)
   };
 
   DA.carrierFreqs = function carrierFreqs(profile) {
@@ -10627,7 +10643,7 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
   };
 
   DA.bandLabel = function bandLabel(profile, auto) {
-    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz";
+    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz · " + profile.symbolMs + "ms";
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
@@ -10954,7 +10970,9 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
         ]);
       }
       for (const [r0, r1] of regions) {
-        const limit = Math.max(0, Math.min(r1, pcm.length) - symbolSamples * (PREAMBLE_BITS.length + 10));
+        // Offsets may sit early; frame body can extend past the search window into pcm.
+        const absLimit = Math.max(0, pcm.length - symbolSamples * (PREAMBLE_BITS.length + 10));
+        const limit = Math.min(absLimit, r1);
         for (let off = r0; off < limit; off += coarse) {
           let score = 0;
           for (let p = 0; p < PREAMBLE_BITS.length; p++) {
@@ -11193,19 +11211,21 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
      */
     async startListenLoop(profile, onFrame, options) {
       options = options || {};
+      // Mutable holder so META can retune without stopping the mic (stopping drops blocks on phones).
+      const profileRef = { current: profile };
       const opened = options.inputStream
         ? await DA.AudioIO.openStreamAsMic(options.inputStream)
         : await DA.AudioIO.openMic();
       const { stream, ctx, source } = opened;
       const sampleRate = ctx.sampleRate;
-      const maxBurstSec = options.maxBurstSec || 14;
+      const maxBurstSec = options.maxBurstSec || 16;
       const maxBurst = Math.ceil(maxBurstSec * sampleRate);
-      const ringLen = Math.ceil((options.windowSec || 12) * sampleRate);
+      const ringLen = Math.ceil((options.windowSec || 14) * sampleRate);
       const ring = new Float32Array(ringLen);
       let writePos = 0;
       let filled = 0;
 
-      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
       const mute = ctx.createGain();
       mute.gain.value = 0;
       const analyser = ctx.createAnalyser();
@@ -11263,7 +11283,7 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
         decoding = true;
         try {
           emit(
-            DA.Modem.decodePcm(snap, profile, sampleRate, {
+            DA.Modem.decodePcm(snap, profileRef.current, sampleRate, {
               maxBytes: options.maxBytes || 8192,
               searchSec: options.searchSec || 1.2,
             })
@@ -11329,8 +11349,8 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
             burstPos += n;
           }
           quietChunks++;
-          // ~0.5s quiet at 2048/48k — end of frame
-          if (quietChunks >= 12) finishBurst();
+    // Quiet longer for phone burst detector (4096 buffers ≈ 85ms/chunk)
+          if (quietChunks >= 14) finishBurst();
         }
 
         const now = performance.now();
@@ -11355,6 +11375,10 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
         sampleRate,
         analyser,
         virtual: !!opened.virtual,
+        profileRef,
+        setProfile(p) {
+          if (p) profileRef.current = p;
+        },
         stop() {
           stopped = true;
           if (inBurst) finishBurst();
@@ -11363,8 +11387,9 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
             const snap = decodeQueue.shift();
             try {
               emit(
-                DA.Modem.decodePcm(snap, profile, sampleRate, {
+                DA.Modem.decodePcm(snap, profileRef.current, sampleRate, {
                   maxBytes: options.maxBytes || 8192,
+                  searchSec: options.searchSec || 1.2,
                 })
               );
             } catch (_) {}
@@ -12208,8 +12233,8 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Quiet gap so RX burst detector can close the frame and decode off-thread
-    await new Promise((r) => setTimeout(r, 750));
+    // Longer quiet gap — phones need time to close burst + decode off-thread
+    await new Promise((r) => setTimeout(r, 1100));
   }
 
   async function startNackListen() {
@@ -12313,14 +12338,24 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
       $("audio-tx-status") &&
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
+      // Triple-send each chunk for phone mic robustness
       await playFrameBytes(bytes);
-      // repeat once for acoustic robustness
       await playFrameBytes(bytes);
+      await playFrameBytes(bytes);
+      state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
+      // Re-announce META every 4 unique blocks so late receivers can join
+      if (state._soundBlocksSent % 4 === 0) {
+        await playFrameBytes(
+          state.session.packMetaFrame({
+            name: (state._meta && state._meta.name) || "file",
+            bandId: state.session.profile.id,
+          })
+        );
+      }
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 50);
-  }
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
 
   function cameraTxLoop() {
     if (!state.running || !state.session) return;
@@ -12343,17 +12378,20 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
     // Prefer fast UA profile so speakers start immediately (skip mic probe)
     const profile =
       state.bandOverride === "auto"
-        ? DA.resolveBandProfile(null)
+        ? DA.resolveBandProfile(null, { mode: state.mode, preferShared: true })
         : DA.resolveBandProfile(state.bandOverride);
     state.session = DA.TransferEngine.createSession(containerBytes, {
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      blockLen: state.mode === "SOUNDONLY" ? 32 : 48,
+      // Small chunks → shorter frames phones can decode; more blocks = clearer %
+      blockLen: state.mode === "SOUNDONLY" ? 16 : 32,
     });
     state.soundIter = null;
     state.camIter = null;
     state.running = true;
+    state._soundBlocksSent = 0;
+    state._meta = meta || {};
     showStageForMode();
     const viz = ensureViz();
     if (viz) viz.setMode("tx");
@@ -12381,7 +12419,9 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
 
     if (state.mode !== "CAMERAONLY") {
       try {
-        await playFrameBytes(state.session.packMetaFrame({ name: meta && meta.name, bandId: profile.id }));
+        const metaBytes = state.session.packMetaFrame({ name: meta && meta.name, bandId: profile.id });
+        await playFrameBytes(metaBytes);
+        await playFrameBytes(metaBytes); // double META for late/phone receivers
       } catch (err) {
         setStatus("שגיאת שידור META: " + (err.message || err), true);
       }
@@ -12740,19 +12780,12 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
           const bandId = new TextDecoder().decode(p.subarray(1, 1 + bandLen));
           if (DA.BAND_PROFILES[bandId]) {
             s.profile = DA.BAND_PROFILES[bandId];
-            $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
-            // restart listen on matching band
-            if (state.listen) {
-              state.listen.stop();
-              state.listen = null;
+            $("audio-band-label-rx") &&
+              ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
+            // Retune in-place — NEVER stop/restart mic (phones drop all following blocks).
+            if (state.listen && typeof state.listen.setProfile === "function") {
+              state.listen.setProfile(s.profile);
             }
-            DA.AudioIO.startListenLoop(s.profile, onFrame, {
-              windowSec: 12,
-              maxBurstSec: 14,
-              maxBytes: 8192,
-            }).then((l) => {
-              state.listen = l;
-            });
           }
         }
       } catch (_) {}
@@ -12790,7 +12823,10 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
   async function startSoundListen() {
     assertMicAvailable();
     setStatus("מבקש הרשאת מיקרופון…");
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
+      mode: state.mode,
+      preferShared: true,
+    });
     if (state.session) state.session.profile = profile;
     $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = DA.bandLabel(profile, state.bandOverride === "auto"));
     if (state.listen) {
@@ -12806,8 +12842,8 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
     state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 12,
-      maxBurstSec: 14,
+      windowSec: 14,
+      maxBurstSec: 16,
       maxBytes: 8192,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);

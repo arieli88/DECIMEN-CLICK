@@ -141,8 +141,8 @@
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Quiet gap so RX burst detector can close the frame and decode off-thread
-    await new Promise((r) => setTimeout(r, 750));
+    // Longer quiet gap — phones need time to close burst + decode off-thread
+    await new Promise((r) => setTimeout(r, 1100));
   }
 
   async function startNackListen() {
@@ -246,14 +246,24 @@
       $("audio-tx-status") &&
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
+      // Triple-send each chunk for phone mic robustness
       await playFrameBytes(bytes);
-      // repeat once for acoustic robustness
       await playFrameBytes(bytes);
+      await playFrameBytes(bytes);
+      state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
+      // Re-announce META every 4 unique blocks so late receivers can join
+      if (state._soundBlocksSent % 4 === 0) {
+        await playFrameBytes(
+          state.session.packMetaFrame({
+            name: (state._meta && state._meta.name) || "file",
+            bandId: state.session.profile.id,
+          })
+        );
+      }
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 50);
-  }
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
 
   function cameraTxLoop() {
     if (!state.running || !state.session) return;
@@ -276,17 +286,20 @@
     // Prefer fast UA profile so speakers start immediately (skip mic probe)
     const profile =
       state.bandOverride === "auto"
-        ? DA.resolveBandProfile(null)
+        ? DA.resolveBandProfile(null, { mode: state.mode, preferShared: true })
         : DA.resolveBandProfile(state.bandOverride);
     state.session = DA.TransferEngine.createSession(containerBytes, {
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      blockLen: state.mode === "SOUNDONLY" ? 32 : 48,
+      // Small chunks → shorter frames phones can decode; more blocks = clearer %
+      blockLen: state.mode === "SOUNDONLY" ? 16 : 32,
     });
     state.soundIter = null;
     state.camIter = null;
     state.running = true;
+    state._soundBlocksSent = 0;
+    state._meta = meta || {};
     showStageForMode();
     const viz = ensureViz();
     if (viz) viz.setMode("tx");
@@ -314,7 +327,9 @@
 
     if (state.mode !== "CAMERAONLY") {
       try {
-        await playFrameBytes(state.session.packMetaFrame({ name: meta && meta.name, bandId: profile.id }));
+        const metaBytes = state.session.packMetaFrame({ name: meta && meta.name, bandId: profile.id });
+        await playFrameBytes(metaBytes);
+        await playFrameBytes(metaBytes); // double META for late/phone receivers
       } catch (err) {
         setStatus("שגיאת שידור META: " + (err.message || err), true);
       }
