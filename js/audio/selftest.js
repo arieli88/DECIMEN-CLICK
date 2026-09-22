@@ -138,7 +138,7 @@
     const tx = DA.TransferEngine.createSession(container, {
       mode: "SOUNDONLY",
       profile,
-      blockLen: 48,
+      blockLen: 36,
       sessionId: (Math.random() * 0xffff) | 1,
     });
     const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
@@ -190,5 +190,34 @@
     }
     const parsed = await DA.parseContainer(rx.assemble());
     return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
+  };
+
+  /**
+   * One-shot TX over BroadcastChannel bus (finite — no infinite loop).
+   * Used for tab-to-tab transfer without speaker/mic.
+   */
+  DA.transferSoundOnlyViaBus = async function transferSoundOnlyViaBus(fileBytes, fileName, mime, opts) {
+    opts = opts || {};
+    const container = await DA.buildContainer(fileName || "file.bin", mime || "application/octet-stream", fileBytes);
+    const profile = DA.resolveBandProfile(opts.band || null);
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: opts.blockLen || 36,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+    const sampleRate = (opts.sampleRate || 48000);
+
+    function publish(bytes) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      if (DA.AudioBus) DA.AudioBus.publishPcm(pcm, sampleRate, profile.id);
+    }
+
+    publish(tx.packMetaFrame({ name: fileName || "file.bin", bandId: profile.id }));
+    for (let seq = 0; seq < tx.k; seq++) {
+      publish(tx.packDataFrame(seq));
+      publish(tx.packDataFrame(seq));
+    }
+    return { ok: true, k: tx.k, sessionId: tx.sessionId, profileId: profile.id, bytes: fileBytes.length };
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);

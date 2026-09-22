@@ -50,6 +50,18 @@
         gain.connect(ctx.destination);
       }
 
+      // Mirror PCM to other Decimen tabs (receiver) — works without speaker→mic
+      try {
+        if (DA.AudioBus && !opts.noBus) {
+          DA.AudioBus.publishPcm(ch, rate, opts.profileId || null);
+        }
+      } catch (_) {}
+
+      // busFast: deliver to BroadcastChannel immediately without waiting for playback
+      if (opts.busFast) {
+        return { analyser, busFast: true };
+      }
+
       return new Promise((resolve) => {
         src.onended = () => resolve({ analyser });
         try {

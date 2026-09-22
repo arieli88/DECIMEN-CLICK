@@ -82,46 +82,56 @@
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
 /* ---- band-select.js ---- */
-/* Decimen audio — band profiles tuned for phone mic/speaker (slow + mid-band) */
+/* Decimen audio — band profiles: balanced speed vs phone reliability */
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
-  // Shared acoustic profile: TX and RX must match. Slow symbols, mid-band only.
+  // Default "balanced": shorter symbols so frames finish (~3–5s) and phones can decode.
+  // "slow" kept for noisy rooms. TX+RX must use the same id (META carries it).
   DA.BAND_PROFILES = {
+    balanced: {
+      id: "balanced",
+      label: "Balanced",
+      fMin: 1500,
+      fMax: 5400,
+      carriers: 12,
+      symbolMs: 28,
+      bitsPerCarrier: 1,
+    },
     shared: {
       id: "shared",
-      label: "Slow shared",
-      fMin: 1400,
-      fMax: 4600,
-      carriers: 8,
-      symbolMs: 52,
+      label: "Shared",
+      fMin: 1500,
+      fMax: 5200,
+      carriers: 10,
+      symbolMs: 32,
       bitsPerCarrier: 1,
     },
     slow: {
       id: "slow",
       label: "Extra slow",
       fMin: 1400,
-      fMax: 4200,
+      fMax: 4600,
       carriers: 8,
-      symbolMs: 68,
+      symbolMs: 48,
       bitsPerCarrier: 1,
     },
     laptop: {
       id: "laptop",
-      label: "Laptop (=shared)",
-      fMin: 1400,
-      fMax: 4600,
-      carriers: 8,
-      symbolMs: 52,
+      label: "Laptop",
+      fMin: 1500,
+      fMax: 5400,
+      carriers: 12,
+      symbolMs: 28,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
-      label: "Phone (=slow)",
-      fMin: 1400,
-      fMax: 4200,
-      carriers: 8,
-      symbolMs: 68,
+      label: "Phone",
+      fMin: 1500,
+      fMax: 5200,
+      carriers: 10,
+      symbolMs: 32,
       bitsPerCarrier: 1,
     },
   };
@@ -138,12 +148,10 @@
     return uaLooksPhone() ? "phone" : "laptop";
   };
 
-  DA.resolveBandProfile = function resolveBandProfile(override, opts) {
-    opts = opts || {};
+  DA.resolveBandProfile = function resolveBandProfile(override) {
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    // SOUNDONLY must use the SAME profile on every device (META retune is best-effort).
-    // Default: extra-slow for reliability over phone speakers/mics.
-    return DA.BAND_PROFILES.slow;
+    // Same default on every device so META is not required for first frames
+    return DA.BAND_PROFILES.balanced;
   };
 
   DA.carrierFreqs = function carrierFreqs(profile) {
@@ -168,7 +176,7 @@
       profile.fMax +
       " Hz · " +
       profile.symbolMs +
-      "ms/sym"
+      "ms"
     );
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
@@ -631,6 +639,18 @@
         if (opts.onAnalyser) opts.onAnalyser(analyser);
       } else if (!opts.silent) {
         gain.connect(ctx.destination);
+      }
+
+      // Mirror PCM to other Decimen tabs (receiver) — works without speaker→mic
+      try {
+        if (DA.AudioBus && !opts.noBus) {
+          DA.AudioBus.publishPcm(ch, rate, opts.profileId || null);
+        }
+      } catch (_) {}
+
+      // busFast: deliver to BroadcastChannel immediately without waiting for playback
+      if (opts.busFast) {
+        return { analyser, busFast: true };
       }
 
       return new Promise((resolve) => {
@@ -1558,6 +1578,55 @@
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
+/* ---- audio-bus.js ---- */
+/* Decimen audio — same-origin TX→RX PCM bus (BroadcastChannel) + optional speakers */
+(function (g) {
+  const DA = (g.DecimenAudio = g.DecimenAudio || {});
+  const BUS = "decimen-pcm-v1";
+
+  DA.AudioBus = {
+    enabled: true,
+    _bc: null,
+    _handlers: [],
+
+    _channel() {
+      if (typeof BroadcastChannel === "undefined") return null;
+      if (!this._bc) {
+        this._bc = new BroadcastChannel(BUS);
+        this._bc.onmessage = (ev) => {
+          const msg = ev && ev.data;
+          if (!msg || msg.t !== "pcm") return;
+          this._handlers.forEach((fn) => {
+            try {
+              fn(msg);
+            } catch (err) {
+              console.warn("AudioBus handler", err);
+            }
+          });
+        };
+      }
+      return this._bc;
+    },
+
+    publishPcm(pcm, sampleRate, profileId) {
+      if (!this.enabled) return;
+      const ch = this._channel();
+      if (!ch) return;
+      // Copy to transferable-friendly plain array for structured clone
+      const copy = Float32Array.from(pcm);
+      ch.postMessage({ t: "pcm", sampleRate: sampleRate, profileId: profileId || "slow", pcm: copy });
+    },
+
+    subscribe(fn) {
+      this._handlers.push(fn);
+      this._channel();
+      return () => {
+        this._handlers = this._handlers.filter((x) => x !== fn);
+      };
+    },
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);
+
 /* ---- selftest.js ---- */
 /* In-browser SOUNDONLY self-test — offline encode/decode of each frame (fast) */
 (function (g) {
@@ -1699,7 +1768,7 @@
     const tx = DA.TransferEngine.createSession(container, {
       mode: "SOUNDONLY",
       profile,
-      blockLen: 48,
+      blockLen: 36,
       sessionId: (Math.random() * 0xffff) | 1,
     });
     const rx = DA.TransferEngine.createSession(new Uint8Array(tx.totalLen), {
@@ -1751,6 +1820,35 @@
     }
     const parsed = await DA.parseContainer(rx.assemble());
     return { ok: true, name: parsed.name, mime: parsed.mime, payload: parsed.payload, k: tx.k };
+  };
+
+  /**
+   * One-shot TX over BroadcastChannel bus (finite — no infinite loop).
+   * Used for tab-to-tab transfer without speaker/mic.
+   */
+  DA.transferSoundOnlyViaBus = async function transferSoundOnlyViaBus(fileBytes, fileName, mime, opts) {
+    opts = opts || {};
+    const container = await DA.buildContainer(fileName || "file.bin", mime || "application/octet-stream", fileBytes);
+    const profile = DA.resolveBandProfile(opts.band || null);
+    const tx = DA.TransferEngine.createSession(container, {
+      mode: "SOUNDONLY",
+      profile,
+      blockLen: opts.blockLen || 36,
+      sessionId: (Math.random() * 0xffff) | 1,
+    });
+    const sampleRate = (opts.sampleRate || 48000);
+
+    function publish(bytes) {
+      const { pcm } = DA.Modem.encodePcm(bytes, profile, sampleRate);
+      if (DA.AudioBus) DA.AudioBus.publishPcm(pcm, sampleRate, profile.id);
+    }
+
+    publish(tx.packMetaFrame({ name: fileName || "file.bin", bandId: profile.id }));
+    for (let seq = 0; seq < tx.k; seq++) {
+      publish(tx.packDataFrame(seq));
+      publish(tx.packDataFrame(seq));
+    }
+    return { ok: true, k: tx.k, sessionId: tx.sessionId, profileId: profile.id, bytes: fileBytes.length };
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
@@ -1809,18 +1907,41 @@
     if (!stage) return;
     const m = state.mode;
     if (m === "CAMERAONLY") {
-      if (waveWrap) waveWrap.hidden = true;
+      // Restore legacy QR canvas — never leave it sticky-hidden after audio modes
+      if (waveWrap) {
+        waveWrap.hidden = true;
+        waveWrap.setAttribute("hidden", "");
+      }
+      if (qrHolder) {
+        qrHolder.hidden = true;
+        qrHolder.setAttribute("hidden", "");
+      }
+      if (qrCanvas) {
+        qrCanvas.hidden = false;
+        qrCanvas.removeAttribute("hidden");
+      }
       return;
     }
     stage.hidden = false;
+    stage.removeAttribute("hidden");
     stage.classList.add("audio-stage-flex");
     if (waveWrap) {
       waveWrap.hidden = false;
       waveWrap.removeAttribute("hidden");
     }
     const showQr = m === "COMBINE" || m === "CAM_SOUND_FB";
-    if (qrHolder) qrHolder.hidden = !showQr;
-    if (qrCanvas) qrCanvas.hidden = true;
+    if (qrHolder) {
+      qrHolder.hidden = !showQr;
+      if (showQr) qrHolder.removeAttribute("hidden");
+    }
+    // Hybrid draws on audio-qr-holder; keep legacy #qr out of the way only in pure SOUNDONLY
+    if (qrCanvas) {
+      if (m === "SOUNDONLY") {
+        qrCanvas.hidden = true;
+      } else if (m === "COMBINE" || m === "CAM_SOUND_FB") {
+        qrCanvas.hidden = true;
+      }
+    }
     ensureViz();
   }
 
@@ -1890,6 +2011,9 @@
     }
     const opts = {
       boost: 1.05,
+      profileId: profile.id,
+      busFast: !!state.busFast,
+      silent: !!state.busFast,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
@@ -1898,9 +2022,30 @@
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Quiet gap — phones need time to close burst + decode
-    const gap = state.soundGapMs != null ? state.soundGapMs : 1300;
+    // Quiet gap between frames (skip when busFast)
+    if (opts.busFast) return;
+    const gap = state.soundGapMs != null ? state.soundGapMs : 700;
     await new Promise((r) => setTimeout(r, gap));
+  }
+
+  function updateTxProgress(seq) {
+    const s = state.session;
+    if (!s) return;
+    const el = $("audio-tx-status");
+    const bar = $("audio-tx-bar");
+    const label = $("audio-tx-progress-label");
+    const pct = Math.floor((100 * ((seq % s.k) + 1)) / s.k);
+    const msg =
+      "שולח בלוק " +
+      ((seq % s.k) + 1) +
+      "/" +
+      s.k +
+      " · " +
+      s.profile.label +
+      (state._soundBlocksSent ? " · מחזורים≈" + Math.floor(state._soundBlocksSent / s.k) : "");
+    if (el) el.textContent = msg;
+    if (label) label.textContent = pct + "% במחזור הנוכחי · K=" + s.k;
+    if (bar) bar.style.width = pct + "%";
   }
 
   async function startNackListen() {
@@ -2001,14 +2146,11 @@
     }
     try {
       const bytes = state.session.packDataFrame(seq);
-      $("audio-tx-status") &&
-        ($("audio-tx-status").textContent =
-          "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
-      // Double-send each chunk (triple was too slow; gap is longer instead)
+      updateTxProgress(seq);
+      // Double-send each chunk
       await playFrameBytes(bytes);
       await playFrameBytes(bytes);
       state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
-      // Re-announce META every 3 unique blocks so late receivers can join
       if (state._soundBlocksSent % 3 === 0) {
         await playFrameBytes(
           state.session.packMetaFrame({
@@ -2020,7 +2162,7 @@
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 250);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 120);
   }
 
   function cameraTxLoop() {
@@ -2051,7 +2193,7 @@
       profile,
       bandOverride: state.bandOverride,
       // Small chunks for phone decode; slightly larger than 16 to cut overhead
-      blockLen: state.mode === "SOUNDONLY" ? 20 : 32,
+      blockLen: state.mode === "SOUNDONLY" ? 36 : 40,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -2126,25 +2268,26 @@
 
         if (state.mode === "SOUNDONLY" || state.mode === "COMBINE") {
           setStatus("מכין קובץ לשמע (דחיסת תמונה אם צריך)…");
-          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 2800, maxEdge: 320 });
+          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 1200, maxEdge: 240 });
           if (prepared.note) setStatus(prepared.note);
           container = await DA.buildContainer(prepared.name, prepared.mime, prepared.bytes);
           meta.name = prepared.name;
           const profileGuess = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
           const eta = DA.estimateSoundSeconds(container.length, {
-            blockLen: 20,
+            blockLen: 36,
             profile: profileGuess,
             reps: 2,
-            gapMs: 1300,
+            gapMs: 700,
           });
           const etaMin = Math.max(1, Math.round(eta / 60));
           setStatus(
             (prepared.note ? prepared.note + " · " : "") +
-              "גודל שידור " +
+              "שידור " +
               container.length +
-              "B · הערכה ~" +
+              "B · ~" +
               etaMin +
-              " דק׳ (איטי בכוונה)"
+              " דק׳ · K≈" +
+              Math.ceil(container.length / 36)
           );
           if (window.__decimenLog) {
             window.__decimenLog(
@@ -2178,6 +2321,15 @@
     }
     document.querySelectorAll('input[name="transport-mode"]').forEach((el) => {
       el.addEventListener("change", () => {
+        const next = currentMode();
+        if (next === "CAMERAONLY") {
+          // Stop audio only — leave legacy QR engine alone
+          stopAll();
+          applyModeUi();
+          showStageForMode();
+          setStatus("מצב מצלמה (QR) — כמו בהתחלה");
+          return;
+        }
         stopAll();
         applyModeUi();
       });
@@ -2566,7 +2718,6 @@
   function onFrame(frame) {
     if (frame.kind === DA.FRAME_META) {
       const s = ensureSessionFromFrame(frame);
-      // payload: bandLen | bandId | nameLen | name
       try {
         const p = frame.payload;
         if (p && p.length >= 2) {
@@ -2576,7 +2727,6 @@
             s.profile = DA.BAND_PROFILES[bandId];
             $("audio-band-label-rx") &&
               ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
-            // Retune in-place — NEVER stop/restart mic (phones drop all following blocks).
             if (state.listen && typeof state.listen.setProfile === "function") {
               state.listen.setProfile(s.profile);
             }
@@ -2588,15 +2738,47 @@
     }
     if (frame.kind === DA.FRAME_DATA) {
       const s = ensureSessionFromFrame(frame);
+      const already = s.received[frame.seq] != null;
       const accepted = s.acceptBlock(frame.seq, frame.payload);
-      if (accepted) persistSession();
+      if (accepted) {
+        persistSession();
+        state._dupStreak = 0;
+      } else if (already) {
+        // Sender is repeating blocks we already have — request missing via audio NACK
+        state._dupStreak = (state._dupStreak || 0) + 1;
+        if (state._dupStreak >= 2) {
+          state._dupStreak = 0;
+          scheduleAutoNack("duplicate");
+        }
+      }
       updateProgressUi();
       finishIfComplete();
     }
   }
 
+  let _nackTimer = null;
+  function scheduleAutoNack(reason) {
+    if (_nackTimer) return;
+    _nackTimer = setTimeout(async () => {
+      _nackTimer = null;
+      if (!state.session || state.nackBusy) return;
+      const missing = state.session.missing();
+      if (!missing.length) return;
+      try {
+        setStatus("NACK אוטומטי (" + reason + "): חסרים " + missing.length + " — משמיע לשולח");
+        await speakNack();
+      } catch (_) {}
+    }, 900);
+  }
+
   function stopListen() {
     state.running = false;
+    if (state._busUnsub) {
+      try {
+        state._busUnsub();
+      } catch (_) {}
+      state._busUnsub = null;
+    }
     if (state.listen) {
       state.listen.stop();
       state.listen = null;
@@ -2615,13 +2797,25 @@
     }
   }
 
-  async function startSoundListen() {
-    assertMicAvailable();
-    setStatus("מבקש הרשאת מיקרופון…");
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
-      mode: state.mode,
-      preferShared: true,
+  function attachAudioBus(profile) {
+    if (!DA.AudioBus || state._busUnsub) return;
+    state._busUnsub = DA.AudioBus.subscribe((msg) => {
+      if (!state.running) return;
+      try {
+        const prof =
+          (msg.profileId && DA.BAND_PROFILES[msg.profileId]) ||
+          (state.session && state.session.profile) ||
+          profile;
+        const result = DA.Modem.decodePcm(msg.pcm, prof, msg.sampleRate, { maxBytes: 8192, searchSec: 1.5 });
+        if (result && result.frame) onFrame(result.frame);
+      } catch (err) {
+        console.warn("bus decode", err);
+      }
     });
+  }
+
+  async function startSoundListen() {
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
     if (state.session) state.session.profile = profile;
     $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = DA.bandLabel(profile, state.bandOverride === "auto"));
     if (state.listen) {
@@ -2636,15 +2830,24 @@
     const viz = ensureViz();
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
-    state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 14,
-      maxBurstSec: 16,
-      maxBytes: 8192,
-      onAnalyser(a) {
-        if (viz) viz.connectAnalyser(a);
-      },
-    });
-    setStatus("מאזין במיקרופון · גלי הקול אמורים לזוז אם יש אות · " + DA.bandLabel(profile, state.bandOverride === "auto"));
+    attachAudioBus(profile);
+
+    // Mic is best-effort — bus still works across tabs without speakers
+    try {
+      assertMicAvailable();
+      setStatus("מבקש הרשאת מיקרופון…");
+      state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
+        windowSec: 10,
+        maxBurstSec: 12,
+        maxBytes: 8192,
+        onAnalyser(a) {
+          if (viz) viz.connectAnalyser(a);
+        },
+      });
+      setStatus("מאזין (מיקרופון + bus) · " + DA.bandLabel(profile, state.bandOverride === "auto"));
+    } catch (err) {
+      setStatus("מיקרופון לא זמין — מאזין רק ל-bus בין לשוניות. " + ((err && err.message) || ""), true);
+    }
   }
 
   async function startHybridCamera() {
@@ -2782,7 +2985,7 @@
     try {
       const profile = state.session.profile;
       const frame = state.session.packNackFrame(missing);
-      // Pause listen briefly to avoid self-echo confusion
+      // Pause listen briefly to avoid self-echo on same device
       const wasListen = state.listen;
       if (wasListen) {
         wasListen.stop();
@@ -2791,14 +2994,14 @@
       const ctx = await DA.AudioIO.ensureContext();
       const { pcm } = DA.Modem.encodePcm(frame, profile, ctx.sampleRate);
       setStatus("Speaking NACK (" + missing.length + " blocks)…");
-      for (let attempt = 0; attempt < 3; attempt++) {
-        await DA.AudioIO.playPcm(pcm, ctx.sampleRate);
-        await new Promise((r) => setTimeout(r, 200));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await DA.AudioIO.playPcm(pcm, ctx.sampleRate, { boost: 1.1, profileId: profile.id });
+        await new Promise((r) => setTimeout(r, 250));
       }
       if (state.running && (state.mode === "SOUNDONLY" || state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB")) {
         await startSoundListen();
       }
-      setStatus("NACK sent · waiting for prioritized blocks");
+      setStatus("NACK נשלח · חסרים " + missing.length + " · ממשיך להאזין");
     } catch (err) {
       setStatus(String(err.message || err), true);
     } finally {
@@ -2814,8 +3017,18 @@
     }
     document.querySelectorAll('input[name="transport-mode"]').forEach((el) => {
       el.addEventListener("change", () => {
-        stopListen();
+        const next = currentMode();
+        if (next === "CAMERAONLY") {
+          stopListen();
+          applyModeUi();
+          setStatus("מצב מצלמה (QR) — כמו בהתחלה");
+          return;
+        }
         applyModeUi();
+        // Always listen in sound modes
+        if (next === "SOUNDONLY" || next === "COMBINE" || next === "CAM_SOUND_FB") {
+          onStartAudioRecv();
+        }
       });
       el.addEventListener("click", () => {
         setTimeout(applyModeUi, 0);
@@ -2864,4 +3077,4 @@
   DA.ReceiverBridge = { state, speakNack, stopListen, applyModeUi };
 })();
 
-try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO && window.DecimenAudio.prepareSoundPayload); if (!window.__DECIMEN_AUDIO_BUNDLE_OK) window.__DECIMEN_AUDIO_BUNDLE_ERR = new Error("DecimenAudio incomplete"); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_OK = false; window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }
+try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO && window.DecimenAudio.AudioBus); } catch(e){ window.__DECIMEN_AUDIO_BUNDLE_OK=false; }

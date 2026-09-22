@@ -52,18 +52,41 @@
     if (!stage) return;
     const m = state.mode;
     if (m === "CAMERAONLY") {
-      if (waveWrap) waveWrap.hidden = true;
+      // Restore legacy QR canvas — never leave it sticky-hidden after audio modes
+      if (waveWrap) {
+        waveWrap.hidden = true;
+        waveWrap.setAttribute("hidden", "");
+      }
+      if (qrHolder) {
+        qrHolder.hidden = true;
+        qrHolder.setAttribute("hidden", "");
+      }
+      if (qrCanvas) {
+        qrCanvas.hidden = false;
+        qrCanvas.removeAttribute("hidden");
+      }
       return;
     }
     stage.hidden = false;
+    stage.removeAttribute("hidden");
     stage.classList.add("audio-stage-flex");
     if (waveWrap) {
       waveWrap.hidden = false;
       waveWrap.removeAttribute("hidden");
     }
     const showQr = m === "COMBINE" || m === "CAM_SOUND_FB";
-    if (qrHolder) qrHolder.hidden = !showQr;
-    if (qrCanvas) qrCanvas.hidden = true;
+    if (qrHolder) {
+      qrHolder.hidden = !showQr;
+      if (showQr) qrHolder.removeAttribute("hidden");
+    }
+    // Hybrid draws on audio-qr-holder; keep legacy #qr out of the way only in pure SOUNDONLY
+    if (qrCanvas) {
+      if (m === "SOUNDONLY") {
+        qrCanvas.hidden = true;
+      } else if (m === "COMBINE" || m === "CAM_SOUND_FB") {
+        qrCanvas.hidden = true;
+      }
+    }
     ensureViz();
   }
 
@@ -133,6 +156,9 @@
     }
     const opts = {
       boost: 1.05,
+      profileId: profile.id,
+      busFast: !!state.busFast,
+      silent: !!state.busFast,
       onAnalyser(a) {
         if (viz) viz.connectAnalyser(a);
       },
@@ -141,9 +167,30 @@
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Quiet gap — phones need time to close burst + decode
-    const gap = state.soundGapMs != null ? state.soundGapMs : 1300;
+    // Quiet gap between frames (skip when busFast)
+    if (opts.busFast) return;
+    const gap = state.soundGapMs != null ? state.soundGapMs : 700;
     await new Promise((r) => setTimeout(r, gap));
+  }
+
+  function updateTxProgress(seq) {
+    const s = state.session;
+    if (!s) return;
+    const el = $("audio-tx-status");
+    const bar = $("audio-tx-bar");
+    const label = $("audio-tx-progress-label");
+    const pct = Math.floor((100 * ((seq % s.k) + 1)) / s.k);
+    const msg =
+      "שולח בלוק " +
+      ((seq % s.k) + 1) +
+      "/" +
+      s.k +
+      " · " +
+      s.profile.label +
+      (state._soundBlocksSent ? " · מחזורים≈" + Math.floor(state._soundBlocksSent / s.k) : "");
+    if (el) el.textContent = msg;
+    if (label) label.textContent = pct + "% במחזור הנוכחי · K=" + s.k;
+    if (bar) bar.style.width = pct + "%";
   }
 
   async function startNackListen() {
@@ -244,14 +291,11 @@
     }
     try {
       const bytes = state.session.packDataFrame(seq);
-      $("audio-tx-status") &&
-        ($("audio-tx-status").textContent =
-          "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
-      // Double-send each chunk (triple was too slow; gap is longer instead)
+      updateTxProgress(seq);
+      // Double-send each chunk
       await playFrameBytes(bytes);
       await playFrameBytes(bytes);
       state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
-      // Re-announce META every 3 unique blocks so late receivers can join
       if (state._soundBlocksSent % 3 === 0) {
         await playFrameBytes(
           state.session.packMetaFrame({
@@ -263,7 +307,7 @@
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 250);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 120);
   }
 
   function cameraTxLoop() {
@@ -294,7 +338,7 @@
       profile,
       bandOverride: state.bandOverride,
       // Small chunks for phone decode; slightly larger than 16 to cut overhead
-      blockLen: state.mode === "SOUNDONLY" ? 20 : 32,
+      blockLen: state.mode === "SOUNDONLY" ? 36 : 40,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -369,25 +413,26 @@
 
         if (state.mode === "SOUNDONLY" || state.mode === "COMBINE") {
           setStatus("מכין קובץ לשמע (דחיסת תמונה אם צריך)…");
-          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 2800, maxEdge: 320 });
+          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 1200, maxEdge: 240 });
           if (prepared.note) setStatus(prepared.note);
           container = await DA.buildContainer(prepared.name, prepared.mime, prepared.bytes);
           meta.name = prepared.name;
           const profileGuess = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
           const eta = DA.estimateSoundSeconds(container.length, {
-            blockLen: 20,
+            blockLen: 36,
             profile: profileGuess,
             reps: 2,
-            gapMs: 1300,
+            gapMs: 700,
           });
           const etaMin = Math.max(1, Math.round(eta / 60));
           setStatus(
             (prepared.note ? prepared.note + " · " : "") +
-              "גודל שידור " +
+              "שידור " +
               container.length +
-              "B · הערכה ~" +
+              "B · ~" +
               etaMin +
-              " דק׳ (איטי בכוונה)"
+              " דק׳ · K≈" +
+              Math.ceil(container.length / 36)
           );
           if (window.__decimenLog) {
             window.__decimenLog(
@@ -421,6 +466,15 @@
     }
     document.querySelectorAll('input[name="transport-mode"]').forEach((el) => {
       el.addEventListener("change", () => {
+        const next = currentMode();
+        if (next === "CAMERAONLY") {
+          // Stop audio only — leave legacy QR engine alone
+          stopAll();
+          applyModeUi();
+          showStageForMode();
+          setStatus("מצב מצלמה (QR) — כמו בהתחלה");
+          return;
+        }
         stopAll();
         applyModeUi();
       });

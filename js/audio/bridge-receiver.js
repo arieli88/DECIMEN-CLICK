@@ -285,7 +285,6 @@
   function onFrame(frame) {
     if (frame.kind === DA.FRAME_META) {
       const s = ensureSessionFromFrame(frame);
-      // payload: bandLen | bandId | nameLen | name
       try {
         const p = frame.payload;
         if (p && p.length >= 2) {
@@ -295,7 +294,6 @@
             s.profile = DA.BAND_PROFILES[bandId];
             $("audio-band-label-rx") &&
               ($("audio-band-label-rx").textContent = "From sender: " + DA.bandLabel(s.profile, false));
-            // Retune in-place — NEVER stop/restart mic (phones drop all following blocks).
             if (state.listen && typeof state.listen.setProfile === "function") {
               state.listen.setProfile(s.profile);
             }
@@ -307,15 +305,47 @@
     }
     if (frame.kind === DA.FRAME_DATA) {
       const s = ensureSessionFromFrame(frame);
+      const already = s.received[frame.seq] != null;
       const accepted = s.acceptBlock(frame.seq, frame.payload);
-      if (accepted) persistSession();
+      if (accepted) {
+        persistSession();
+        state._dupStreak = 0;
+      } else if (already) {
+        // Sender is repeating blocks we already have — request missing via audio NACK
+        state._dupStreak = (state._dupStreak || 0) + 1;
+        if (state._dupStreak >= 2) {
+          state._dupStreak = 0;
+          scheduleAutoNack("duplicate");
+        }
+      }
       updateProgressUi();
       finishIfComplete();
     }
   }
 
+  let _nackTimer = null;
+  function scheduleAutoNack(reason) {
+    if (_nackTimer) return;
+    _nackTimer = setTimeout(async () => {
+      _nackTimer = null;
+      if (!state.session || state.nackBusy) return;
+      const missing = state.session.missing();
+      if (!missing.length) return;
+      try {
+        setStatus("NACK אוטומטי (" + reason + "): חסרים " + missing.length + " — משמיע לשולח");
+        await speakNack();
+      } catch (_) {}
+    }, 900);
+  }
+
   function stopListen() {
     state.running = false;
+    if (state._busUnsub) {
+      try {
+        state._busUnsub();
+      } catch (_) {}
+      state._busUnsub = null;
+    }
     if (state.listen) {
       state.listen.stop();
       state.listen = null;
@@ -334,13 +364,25 @@
     }
   }
 
-  async function startSoundListen() {
-    assertMicAvailable();
-    setStatus("מבקש הרשאת מיקרופון…");
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
-      mode: state.mode,
-      preferShared: true,
+  function attachAudioBus(profile) {
+    if (!DA.AudioBus || state._busUnsub) return;
+    state._busUnsub = DA.AudioBus.subscribe((msg) => {
+      if (!state.running) return;
+      try {
+        const prof =
+          (msg.profileId && DA.BAND_PROFILES[msg.profileId]) ||
+          (state.session && state.session.profile) ||
+          profile;
+        const result = DA.Modem.decodePcm(msg.pcm, prof, msg.sampleRate, { maxBytes: 8192, searchSec: 1.5 });
+        if (result && result.frame) onFrame(result.frame);
+      } catch (err) {
+        console.warn("bus decode", err);
+      }
     });
+  }
+
+  async function startSoundListen() {
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
     if (state.session) state.session.profile = profile;
     $("audio-band-label-rx") && ($("audio-band-label-rx").textContent = DA.bandLabel(profile, state.bandOverride === "auto"));
     if (state.listen) {
@@ -355,15 +397,24 @@
     const viz = ensureViz();
     if (viz) viz.setMode("rx");
     await DA.AudioIO.ensureContext();
-    state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
-      windowSec: 14,
-      maxBurstSec: 16,
-      maxBytes: 8192,
-      onAnalyser(a) {
-        if (viz) viz.connectAnalyser(a);
-      },
-    });
-    setStatus("מאזין במיקרופון · גלי הקול אמורים לזוז אם יש אות · " + DA.bandLabel(profile, state.bandOverride === "auto"));
+    attachAudioBus(profile);
+
+    // Mic is best-effort — bus still works across tabs without speakers
+    try {
+      assertMicAvailable();
+      setStatus("מבקש הרשאת מיקרופון…");
+      state.listen = await DA.AudioIO.startListenLoop(profile, onFrame, {
+        windowSec: 10,
+        maxBurstSec: 12,
+        maxBytes: 8192,
+        onAnalyser(a) {
+          if (viz) viz.connectAnalyser(a);
+        },
+      });
+      setStatus("מאזין (מיקרופון + bus) · " + DA.bandLabel(profile, state.bandOverride === "auto"));
+    } catch (err) {
+      setStatus("מיקרופון לא זמין — מאזין רק ל-bus בין לשוניות. " + ((err && err.message) || ""), true);
+    }
   }
 
   async function startHybridCamera() {
@@ -501,7 +552,7 @@
     try {
       const profile = state.session.profile;
       const frame = state.session.packNackFrame(missing);
-      // Pause listen briefly to avoid self-echo confusion
+      // Pause listen briefly to avoid self-echo on same device
       const wasListen = state.listen;
       if (wasListen) {
         wasListen.stop();
@@ -510,14 +561,14 @@
       const ctx = await DA.AudioIO.ensureContext();
       const { pcm } = DA.Modem.encodePcm(frame, profile, ctx.sampleRate);
       setStatus("Speaking NACK (" + missing.length + " blocks)…");
-      for (let attempt = 0; attempt < 3; attempt++) {
-        await DA.AudioIO.playPcm(pcm, ctx.sampleRate);
-        await new Promise((r) => setTimeout(r, 200));
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await DA.AudioIO.playPcm(pcm, ctx.sampleRate, { boost: 1.1, profileId: profile.id });
+        await new Promise((r) => setTimeout(r, 250));
       }
       if (state.running && (state.mode === "SOUNDONLY" || state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB")) {
         await startSoundListen();
       }
-      setStatus("NACK sent · waiting for prioritized blocks");
+      setStatus("NACK נשלח · חסרים " + missing.length + " · ממשיך להאזין");
     } catch (err) {
       setStatus(String(err.message || err), true);
     } finally {
@@ -533,8 +584,18 @@
     }
     document.querySelectorAll('input[name="transport-mode"]').forEach((el) => {
       el.addEventListener("change", () => {
-        stopListen();
+        const next = currentMode();
+        if (next === "CAMERAONLY") {
+          stopListen();
+          applyModeUi();
+          setStatus("מצב מצלמה (QR) — כמו בהתחלה");
+          return;
+        }
         applyModeUi();
+        // Always listen in sound modes
+        if (next === "SOUNDONLY" || next === "COMBINE" || next === "CAM_SOUND_FB") {
+          onStartAudioRecv();
+        }
       });
       el.addEventListener("click", () => {
         setTimeout(applyModeUi, 0);
