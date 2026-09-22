@@ -141,8 +141,9 @@
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Longer quiet gap — phones need time to close burst + decode off-thread
-    await new Promise((r) => setTimeout(r, 1100));
+    // Quiet gap — phones need time to close burst + decode
+    const gap = state.soundGapMs != null ? state.soundGapMs : 1300;
+    await new Promise((r) => setTimeout(r, gap));
   }
 
   async function startNackListen() {
@@ -246,13 +247,12 @@
       $("audio-tx-status") &&
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
-      // Triple-send each chunk for phone mic robustness
-      await playFrameBytes(bytes);
+      // Double-send each chunk (triple was too slow; gap is longer instead)
       await playFrameBytes(bytes);
       await playFrameBytes(bytes);
       state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
-      // Re-announce META every 4 unique blocks so late receivers can join
-      if (state._soundBlocksSent % 4 === 0) {
+      // Re-announce META every 3 unique blocks so late receivers can join
+      if (state._soundBlocksSent % 3 === 0) {
         await playFrameBytes(
           state.session.packMetaFrame({
             name: (state._meta && state._meta.name) || "file",
@@ -263,7 +263,7 @@
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 250);
   }
 
   function cameraTxLoop() {
@@ -293,8 +293,8 @@
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      // Small chunks → shorter frames phones can decode; more blocks = clearer %
-      blockLen: state.mode === "SOUNDONLY" ? 16 : 32,
+      // Small chunks for phone decode; slightly larger than 16 to cut overhead
+      blockLen: state.mode === "SOUNDONLY" ? 20 : 32,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -364,10 +364,47 @@
         const file = fileOverride || state.file || (cfg && cfg.files && cfg.files[0]);
         if (!file) throw new Error("בחרו קובץ קודם (אותו בורר כמו ל-QR)");
         state.file = file;
-        container = await buildFromFile(file);
-        meta.name = file.name;
         const label = $("file-picker-label");
         if (label) label.textContent = file.name;
+
+        if (state.mode === "SOUNDONLY" || state.mode === "COMBINE") {
+          setStatus("מכין קובץ לשמע (דחיסת תמונה אם צריך)…");
+          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 2800, maxEdge: 320 });
+          if (prepared.note) setStatus(prepared.note);
+          container = await DA.buildContainer(prepared.name, prepared.mime, prepared.bytes);
+          meta.name = prepared.name;
+          const profileGuess = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+          const eta = DA.estimateSoundSeconds(container.length, {
+            blockLen: 20,
+            profile: profileGuess,
+            reps: 2,
+            gapMs: 1300,
+          });
+          const etaMin = Math.max(1, Math.round(eta / 60));
+          setStatus(
+            (prepared.note ? prepared.note + " · " : "") +
+              "גודל שידור " +
+              container.length +
+              "B · הערכה ~" +
+              etaMin +
+              " דק׳ (איטי בכוונה)"
+          );
+          if (window.__decimenLog) {
+            window.__decimenLog(
+              "SOUND prep " +
+                prepared.originalBytes +
+                "→" +
+                prepared.bytes.length +
+                " container=" +
+                container.length +
+                " etaSec≈" +
+                eta
+            );
+          }
+        } else {
+          container = await buildFromFile(file);
+          meta.name = file.name;
+        }
       }
       await startTransfer(container, meta);
     } catch (err) {

@@ -86,34 +86,42 @@
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
-  // Shared acoustic profile: both laptop and phone MUST use the same for SOUNDONLY.
-  // Fewer carriers, lower fMax (phone mics roll off above ~5 kHz), longer symbols.
+  // Shared acoustic profile: TX and RX must match. Slow symbols, mid-band only.
   DA.BAND_PROFILES = {
     shared: {
       id: "shared",
-      label: "Shared (phone-safe)",
+      label: "Slow shared",
       fMin: 1400,
-      fMax: 4800,
-      carriers: 8, // 4 bit/symbol — slower but robust
-      symbolMs: 56,
+      fMax: 4600,
+      carriers: 8,
+      symbolMs: 52,
+      bitsPerCarrier: 1,
+    },
+    slow: {
+      id: "slow",
+      label: "Extra slow",
+      fMin: 1400,
+      fMax: 4200,
+      carriers: 8,
+      symbolMs: 68,
       bitsPerCarrier: 1,
     },
     laptop: {
       id: "laptop",
-      label: "Laptop",
+      label: "Laptop (=shared)",
       fMin: 1400,
-      fMax: 4800,
+      fMax: 4600,
       carriers: 8,
       symbolMs: 52,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
-      label: "Phone",
+      label: "Phone (=slow)",
       fMin: 1400,
-      fMax: 4800,
+      fMax: 4200,
       carriers: 8,
-      symbolMs: 60,
+      symbolMs: 68,
       bitsPerCarrier: 1,
     },
   };
@@ -130,15 +138,12 @@
     return uaLooksPhone() ? "phone" : "laptop";
   };
 
-  /**
-   * For SOUNDONLY always prefer shared profile so TX/RX match across devices.
-   * Override still honored when user picks laptop/phone explicitly.
-   */
   DA.resolveBandProfile = function resolveBandProfile(override, opts) {
     opts = opts || {};
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    if (opts.mode === "SOUNDONLY" || opts.preferShared) return DA.BAND_PROFILES.shared;
-    return DA.BAND_PROFILES.shared; // default: shared (was device-split; mismatched bands broke phones)
+    // SOUNDONLY must use the SAME profile on every device (META retune is best-effort).
+    // Default: extra-slow for reliability over phone speakers/mics.
+    return DA.BAND_PROFILES.slow;
   };
 
   DA.carrierFreqs = function carrierFreqs(profile) {
@@ -154,7 +159,17 @@
   };
 
   DA.bandLabel = function bandLabel(profile, auto) {
-    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz · " + profile.symbolMs + "ms";
+    return (
+      (auto ? "Auto: " : "") +
+      profile.label +
+      " · " +
+      profile.fMin +
+      "–" +
+      profile.fMax +
+      " Hz · " +
+      profile.symbolMs +
+      "ms/sym"
+    );
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
@@ -1404,6 +1419,145 @@
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);
 
+/* ---- sound-prep.js ---- */
+/* Decimen audio — prepare payloads for slow acoustic channel */
+(function (g) {
+  const DA = (g.DecimenAudio = g.DecimenAudio || {});
+
+  function bytesToBase64(bytes) {
+    let s = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(s);
+  }
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  DA.bytesToBase64 = bytesToBase64;
+  DA.base64ToBytes = base64ToBytes;
+
+  /** Estimate acoustic TX time (seconds) for container size. */
+  DA.estimateSoundSeconds = function estimateSoundSeconds(byteLen, opts) {
+    opts = opts || {};
+    const blockLen = opts.blockLen || 20;
+    const symbolMs = (opts.profile && opts.profile.symbolMs) || 48;
+    const reps = opts.reps || 2;
+    const gapMs = opts.gapMs || 1200;
+    const k = Math.max(1, Math.ceil(byteLen / blockLen));
+    // ~header+FEC ≈ 2.2× payload + ~22 symbols framing
+    const bitsPerSym = Math.max(1, Math.floor(((opts.profile && opts.profile.carriers) || 8) / 2));
+    const frameBytes = 18 + blockLen;
+    const fecBytes = Math.ceil(frameBytes * 2.05);
+    const dataSyms = Math.ceil((16 + fecBytes * 8) / bitsPerSym);
+    const totalSyms = 22 + dataSyms;
+    const frameMs = totalSyms * symbolMs + gapMs;
+    return Math.ceil(((k + 2) * reps * frameMs) / 1000);
+  };
+
+  /**
+   * For SOUNDONLY: shrink images so transfer is practical over speakers/mic.
+   * Non-images pass through (caller should warn if huge).
+   */
+  DA.prepareSoundPayload = async function prepareSoundPayload(file, opts) {
+    opts = opts || {};
+    const maxBytes = opts.maxBytes || 5500;
+    const maxEdge = opts.maxEdge || 420;
+    const quality = opts.quality != null ? opts.quality : 0.42;
+    const name = file.name || "file.bin";
+    const mime = file.type || "application/octet-stream";
+    const raw = new Uint8Array(await file.arrayBuffer());
+
+    const isImage = /^image\/(jpeg|jpg|png|webp|gif)$/i.test(mime) || /\.(jpe?g|png|webp|gif)$/i.test(name);
+    if (!isImage) {
+      return {
+        bytes: raw,
+        name,
+        mime,
+        compressed: false,
+        originalBytes: raw.length,
+        note: raw.length > maxBytes ? "קובץ גדול לשמע — שקלו תמונה/טקסט קטן" : null,
+      };
+    }
+
+    if (typeof createImageBitmap !== "function" && typeof Image === "undefined") {
+      return { bytes: raw, name, mime, compressed: false, originalBytes: raw.length };
+    }
+
+    let bitmap;
+    try {
+      bitmap = await createImageBitmap(new Blob([raw], { type: mime }));
+    } catch (_) {
+      return { bytes: raw, name, mime, compressed: false, originalBytes: raw.length };
+    }
+
+    let w = bitmap.width;
+    let h = bitmap.height;
+    const scale = Math.min(1, maxEdge / Math.max(w, h));
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    try {
+      bitmap.close && bitmap.close();
+    } catch (_) {}
+
+    let q = quality;
+    let blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
+    while (blob && blob.size > maxBytes && q > 0.16) {
+      q -= 0.06;
+      blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
+    }
+    // Still too big? shrink canvas further
+    let edge = Math.min(w, h);
+    while (blob && blob.size > maxBytes && edge > 120) {
+      edge = Math.floor(edge * 0.75);
+      const c2 = document.createElement("canvas");
+      const scale2 = edge / Math.max(w, h);
+      c2.width = Math.max(1, Math.round(w * scale2));
+      c2.height = Math.max(1, Math.round(h * scale2));
+      const ctx2 = c2.getContext("2d");
+      ctx2.fillStyle = "#fff";
+      ctx2.fillRect(0, 0, c2.width, c2.height);
+      ctx2.drawImage(canvas, 0, 0, c2.width, c2.height);
+      w = c2.width;
+      h = c2.height;
+      canvas.width = w;
+      canvas.height = h;
+      canvas.getContext("2d").drawImage(c2, 0, 0);
+      q = Math.min(q, 0.4);
+      blob = await new Promise((res) => canvas.toBlob(res, "image/jpeg", q));
+    }
+    if (!blob) {
+      return { bytes: raw, name, mime, compressed: false, originalBytes: raw.length };
+    }
+    const out = new Uint8Array(await blob.arrayBuffer());
+    const outName = name.replace(/\.[^.]+$/, "") + ".sound.jpg";
+    return {
+      bytes: out,
+      name: outName,
+      mime: "image/jpeg",
+      compressed: true,
+      originalBytes: raw.length,
+      width: w,
+      height: h,
+      quality: q,
+      note: "דחוס לשמע: " + raw.length + "→" + out.length + " בתים (" + w + "×" + h + ")",
+    };
+  };
+})(typeof globalThis !== "undefined" ? globalThis : window);
+
 /* ---- selftest.js ---- */
 /* In-browser SOUNDONLY self-test — offline encode/decode of each frame (fast) */
 (function (g) {
@@ -1744,8 +1898,9 @@
       opts.loopDest = state.loopback.dest;
     }
     await DA.AudioIO.playPcm(padded, ctx.sampleRate, opts);
-    // Longer quiet gap — phones need time to close burst + decode off-thread
-    await new Promise((r) => setTimeout(r, 1100));
+    // Quiet gap — phones need time to close burst + decode
+    const gap = state.soundGapMs != null ? state.soundGapMs : 1300;
+    await new Promise((r) => setTimeout(r, gap));
   }
 
   async function startNackListen() {
@@ -1849,13 +2004,12 @@
       $("audio-tx-status") &&
         ($("audio-tx-status").textContent =
           "TX sound block " + (seq + 1) + "/" + state.session.k + " · " + state.session.profile.label);
-      // Triple-send each chunk for phone mic robustness
-      await playFrameBytes(bytes);
+      // Double-send each chunk (triple was too slow; gap is longer instead)
       await playFrameBytes(bytes);
       await playFrameBytes(bytes);
       state._soundBlocksSent = (state._soundBlocksSent || 0) + 1;
-      // Re-announce META every 4 unique blocks so late receivers can join
-      if (state._soundBlocksSent % 4 === 0) {
+      // Re-announce META every 3 unique blocks so late receivers can join
+      if (state._soundBlocksSent % 3 === 0) {
         await playFrameBytes(
           state.session.packMetaFrame({
             name: (state._meta && state._meta.name) || "file",
@@ -1866,7 +2020,7 @@
     } catch (err) {
       setStatus(String(err.message || err), true);
     }
-    if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
+    if (state.running) state.txTimer = setTimeout(soundTxLoop, 250);
   }
 
   function cameraTxLoop() {
@@ -1896,8 +2050,8 @@
       mode: state.mode,
       profile,
       bandOverride: state.bandOverride,
-      // Small chunks → shorter frames phones can decode; more blocks = clearer %
-      blockLen: state.mode === "SOUNDONLY" ? 16 : 32,
+      // Small chunks for phone decode; slightly larger than 16 to cut overhead
+      blockLen: state.mode === "SOUNDONLY" ? 20 : 32,
     });
     state.soundIter = null;
     state.camIter = null;
@@ -1967,10 +2121,47 @@
         const file = fileOverride || state.file || (cfg && cfg.files && cfg.files[0]);
         if (!file) throw new Error("בחרו קובץ קודם (אותו בורר כמו ל-QR)");
         state.file = file;
-        container = await buildFromFile(file);
-        meta.name = file.name;
         const label = $("file-picker-label");
         if (label) label.textContent = file.name;
+
+        if (state.mode === "SOUNDONLY" || state.mode === "COMBINE") {
+          setStatus("מכין קובץ לשמע (דחיסת תמונה אם צריך)…");
+          const prepared = await DA.prepareSoundPayload(file, { maxBytes: 2800, maxEdge: 320 });
+          if (prepared.note) setStatus(prepared.note);
+          container = await DA.buildContainer(prepared.name, prepared.mime, prepared.bytes);
+          meta.name = prepared.name;
+          const profileGuess = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+          const eta = DA.estimateSoundSeconds(container.length, {
+            blockLen: 20,
+            profile: profileGuess,
+            reps: 2,
+            gapMs: 1300,
+          });
+          const etaMin = Math.max(1, Math.round(eta / 60));
+          setStatus(
+            (prepared.note ? prepared.note + " · " : "") +
+              "גודל שידור " +
+              container.length +
+              "B · הערכה ~" +
+              etaMin +
+              " דק׳ (איטי בכוונה)"
+          );
+          if (window.__decimenLog) {
+            window.__decimenLog(
+              "SOUND prep " +
+                prepared.originalBytes +
+                "→" +
+                prepared.bytes.length +
+                " container=" +
+                container.length +
+                " etaSec≈" +
+                eta
+            );
+          }
+        } else {
+          container = await buildFromFile(file);
+          meta.name = file.name;
+        }
       }
       await startTransfer(container, meta);
     } catch (err) {
@@ -2201,9 +2392,30 @@
   }
 
   function ensureSessionFromFrame(frame) {
-    if (state.session && state.session.sessionId === frame.sessionId) return state.session;
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
-    // Create empty session skeleton matching frame params
+    if (state.session && state.session.sessionId === frame.sessionId) {
+      // Keep existing received[] — never wipe progress on META re-announce
+      if (frame.k && frame.k !== state.session.k) {
+        // Rare: grow array if sender reports larger k, preserve old blocks
+        const next = new Array(frame.k).fill(null);
+        for (let i = 0; i < state.session.received.length && i < next.length; i++) {
+          next[i] = state.session.received[i];
+        }
+        state.session.k = frame.k;
+        state.session.blockLen = frame.blockLen || state.session.blockLen;
+        state.session.totalLen = frame.totalLen || state.session.totalLen;
+        state.session.received = next;
+      }
+      return state.session;
+    }
+    // Different session — try restore from cache first
+    const cached = loadCachedSession(frame.sessionId);
+    if (cached) {
+      state.session = cached;
+      return state.session;
+    }
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
+      mode: state.mode,
+    });
     const k = frame.k || 1;
     const blockLen = frame.blockLen || 40;
     const totalLen = frame.totalLen || k * blockLen;
@@ -2214,7 +2426,6 @@
       sessionId: frame.sessionId,
       blockLen,
     });
-    // Override blocks with empty received tracking only — blocks array unused on RX
     state.session.k = k;
     state.session.blockLen = blockLen;
     state.session.totalLen = totalLen;
@@ -2222,20 +2433,91 @@
     return state.session;
   }
 
+  const RX_CACHE_KEY = "decimen-rx-v1";
+
+  function persistSession() {
+    const s = state.session;
+    if (!s || !s.sessionId) return;
+    try {
+      const blocks = [];
+      for (let i = 0; i < s.k; i++) {
+        if (!s.received[i]) continue;
+        blocks.push({ i: i, b64: DA.bytesToBase64(s.received[i]) });
+      }
+      const payload = {
+        sessionId: s.sessionId,
+        k: s.k,
+        blockLen: s.blockLen,
+        totalLen: s.totalLen,
+        blocks: blocks,
+        savedAt: Date.now(),
+      };
+      sessionStorage.setItem(RX_CACHE_KEY, JSON.stringify(payload));
+    } catch (_) {}
+  }
+
+  function loadCachedSession(sessionId) {
+    try {
+      const raw = sessionStorage.getItem(RX_CACHE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || data.sessionId !== sessionId) return null;
+      const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+      const placeholder = new Uint8Array(data.totalLen || data.k * data.blockLen);
+      const s = DA.TransferEngine.createSession(placeholder, {
+        mode: state.mode,
+        profile,
+        sessionId: data.sessionId,
+        blockLen: data.blockLen,
+      });
+      s.k = data.k;
+      s.blockLen = data.blockLen;
+      s.totalLen = data.totalLen;
+      s.received = new Array(data.k).fill(null);
+      (data.blocks || []).forEach((b) => {
+        if (b && b.i >= 0 && b.i < s.k && b.b64) s.received[b.i] = DA.base64ToBytes(b.b64);
+      });
+      return s;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function clearSessionCache() {
+    try {
+      sessionStorage.removeItem(RX_CACHE_KEY);
+    } catch (_) {}
+    state.session = null;
+    updateProgressUi();
+  }
+
   function updateProgressUi() {
     const s = state.session;
     const label = $("audio-progress-label");
     const missEl = $("audio-missing-label");
+    const explain = $("audio-progress-explain");
     if (!s) {
-      if (label) label.textContent = "—";
+      if (label) label.textContent = "— אין סשן עדיין";
       if (missEl) missEl.textContent = "—";
+      if (explain) explain.textContent = "האחוזים = בלוקי קובץ שהתקבלו (לא עוצמת מיקרופון).";
       return;
     }
     const solved = s.solvedCount();
-    const pct = Math.floor((100 * solved) / s.k);
-    if (label) label.textContent = pct + "% · " + solved + "/" + s.k + " blocks";
+    const pct = Math.floor((100 * solved) / Math.max(1, s.k));
+    if (label) {
+      label.textContent =
+        pct + "% · " + solved + "/" + s.k + " בלוקים שמורים" + (solved ? " ✓ נשמרים בזיכרון" : "");
+    }
     const missing = s.missing();
-    if (missEl) missEl.textContent = missing.length ? "Missing: " + missing.slice(0, 24).join(",") + (missing.length > 24 ? "…" : "") : "Complete";
+    if (missEl) {
+      missEl.textContent = missing.length
+        ? "חסרים: " + missing.slice(0, 20).join(",") + (missing.length > 20 ? "…" : "")
+        : "הושלם — כל הבלוקים התקבלו";
+    }
+    if (explain) {
+      explain.textContent =
+        "התקדמות = חלקי הקובץ שכבר נקלט (cache). גל המיקופון למעלה = עוצמה חיה, לא אחוזי קובץ.";
+    }
     const bar = $("audio-bar");
     if (bar) bar.style.width = pct + "%";
     const nackBtn = $("audio-nack-speak");
@@ -2306,7 +2588,8 @@
     }
     if (frame.kind === DA.FRAME_DATA) {
       const s = ensureSessionFromFrame(frame);
-      s.acceptBlock(frame.seq, frame.payload);
+      const accepted = s.acceptBlock(frame.seq, frame.payload);
+      if (accepted) persistSession();
       updateProgressUi();
       finishIfComplete();
     }
@@ -2371,10 +2654,19 @@
     if (preview) preview.style.display = "";
     state.camStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: "environment", width: { ideal: 1280 } },
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        // Continuous AF while hunting QR (supported devices only)
+        focusMode: { ideal: "continuous" },
+      },
     });
+    await applyContinuousAutofocus(state.camStream);
     video.srcObject = state.camStream;
     await video.play();
+    // Re-assert AF after tracks settle
+    setTimeout(() => applyContinuousAutofocus(state.camStream), 400);
+    setTimeout(() => applyContinuousAutofocus(state.camStream), 1200);
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     state.camTimer = setInterval(async () => {
@@ -2407,6 +2699,24 @@
     }, 120);
   }
 
+  async function applyContinuousAutofocus(stream) {
+    if (!stream) return;
+    const track = stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof track.getCapabilities !== "function") return;
+    try {
+      const caps = track.getCapabilities() || {};
+      const modes = caps.focusMode || [];
+      if (modes.indexOf("continuous") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        if (window.__decimenLog) window.__decimenLog("Camera autofocus: continuous");
+      } else if (modes.indexOf("auto") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "auto" }] });
+      }
+    } catch (err) {
+      if (window.__decimenLog) window.__decimenLog("Autofocus skip: " + ((err && err.message) || err));
+    }
+  }
+
   async function onStartAudioRecv() {
     try {
       applyModeUi();
@@ -2414,9 +2724,29 @@
         setStatus("למצב CAMERAONLY השתמשו ב-Start camera הרגיל.");
         return;
       }
-      stopListen();
+      // Keep incomplete session cache — do NOT wipe progress on re-listen
+      const keepSession = state.session && state.session.solvedCount() > 0 && state.session.solvedCount() < state.session.k;
+      if (state.listen) {
+        state.listen.stop();
+        state.listen = null;
+      }
       state.running = true;
-      state.session = null;
+      if (!keepSession) {
+        // Try hydrate from sessionStorage if any
+        try {
+          const raw = sessionStorage.getItem("decimen-rx-v1");
+          if (raw) {
+            const data = JSON.parse(raw);
+            if (data && data.sessionId) {
+              const restored = loadCachedSession(data.sessionId);
+              if (restored && restored.solvedCount() > 0) {
+                state.session = restored;
+                setStatus("שוחזרה התקדמות: " + restored.solvedCount() + "/" + restored.k + " בלוקים מהזיכרון");
+              }
+            }
+          }
+        } catch (_) {}
+      }
       updateProgressUi();
       if (state.mode === "SOUNDONLY" || state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB") {
         await startSoundListen();
@@ -2424,7 +2754,12 @@
       if (state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB") {
         await startHybridCamera();
       }
-      setStatus("Receiving (" + state.mode + ")…");
+      setStatus(
+        "Receiving (" +
+          state.mode +
+          ")…" +
+          (state.session ? " · סשן פעיל " + state.session.solvedCount() + "/" + state.session.k : "")
+      );
     } catch (err) {
       const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String((err && err.message) || err);
       setStatus(mapped, true);
@@ -2497,7 +2832,12 @@
     $("audio-recv-stop") &&
       $("audio-recv-stop").addEventListener("click", () => {
         stopListen();
-        setStatus("Stopped");
+        setStatus("Stopped — התקדמות נשמרה בזיכרון");
+      });
+    $("audio-rx-clear") &&
+      $("audio-rx-clear").addEventListener("click", () => {
+        clearSessionCache();
+        setStatus("נוקה cache של בלוקים שהתקבלו");
       });
     $("audio-nack-speak") && $("audio-nack-speak").addEventListener("click", speakNack);
 
@@ -2524,4 +2864,4 @@
   DA.ReceiverBridge = { state, speakNack, stopListen, applyModeUi };
 })();
 
-try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO); if (!window.__DECIMEN_AUDIO_BUNDLE_OK) window.__DECIMEN_AUDIO_BUNDLE_ERR = new Error("DecimenAudio incomplete after bundle"); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_OK = false; window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }
+try { window.__DECIMEN_AUDIO_BUNDLE_OK = !!(window.DecimenAudio && window.DecimenAudio.Modem && window.DecimenAudio.AudioIO && window.DecimenAudio.prepareSoundPayload); if (!window.__DECIMEN_AUDIO_BUNDLE_OK) window.__DECIMEN_AUDIO_BUNDLE_ERR = new Error("DecimenAudio incomplete"); } catch (e) { window.__DECIMEN_AUDIO_BUNDLE_OK = false; window.__DECIMEN_AUDIO_BUNDLE_ERR = e; }

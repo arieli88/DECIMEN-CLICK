@@ -2,34 +2,42 @@
 (function (g) {
   const DA = (g.DecimenAudio = g.DecimenAudio || {});
 
-  // Shared acoustic profile: both laptop and phone MUST use the same for SOUNDONLY.
-  // Fewer carriers, lower fMax (phone mics roll off above ~5 kHz), longer symbols.
+  // Shared acoustic profile: TX and RX must match. Slow symbols, mid-band only.
   DA.BAND_PROFILES = {
     shared: {
       id: "shared",
-      label: "Shared (phone-safe)",
+      label: "Slow shared",
       fMin: 1400,
-      fMax: 4800,
-      carriers: 8, // 4 bit/symbol — slower but robust
-      symbolMs: 56,
+      fMax: 4600,
+      carriers: 8,
+      symbolMs: 52,
+      bitsPerCarrier: 1,
+    },
+    slow: {
+      id: "slow",
+      label: "Extra slow",
+      fMin: 1400,
+      fMax: 4200,
+      carriers: 8,
+      symbolMs: 68,
       bitsPerCarrier: 1,
     },
     laptop: {
       id: "laptop",
-      label: "Laptop",
+      label: "Laptop (=shared)",
       fMin: 1400,
-      fMax: 4800,
+      fMax: 4600,
       carriers: 8,
       symbolMs: 52,
       bitsPerCarrier: 1,
     },
     phone: {
       id: "phone",
-      label: "Phone",
+      label: "Phone (=slow)",
       fMin: 1400,
-      fMax: 4800,
+      fMax: 4200,
       carriers: 8,
-      symbolMs: 60,
+      symbolMs: 68,
       bitsPerCarrier: 1,
     },
   };
@@ -46,15 +54,12 @@
     return uaLooksPhone() ? "phone" : "laptop";
   };
 
-  /**
-   * For SOUNDONLY always prefer shared profile so TX/RX match across devices.
-   * Override still honored when user picks laptop/phone explicitly.
-   */
   DA.resolveBandProfile = function resolveBandProfile(override, opts) {
     opts = opts || {};
     if (override && DA.BAND_PROFILES[override]) return DA.BAND_PROFILES[override];
-    if (opts.mode === "SOUNDONLY" || opts.preferShared) return DA.BAND_PROFILES.shared;
-    return DA.BAND_PROFILES.shared; // default: shared (was device-split; mismatched bands broke phones)
+    // SOUNDONLY must use the SAME profile on every device (META retune is best-effort).
+    // Default: extra-slow for reliability over phone speakers/mics.
+    return DA.BAND_PROFILES.slow;
   };
 
   DA.carrierFreqs = function carrierFreqs(profile) {
@@ -70,6 +75,16 @@
   };
 
   DA.bandLabel = function bandLabel(profile, auto) {
-    return (auto ? "Auto: " : "") + profile.label + " · " + profile.fMin + "–" + profile.fMax + " Hz · " + profile.symbolMs + "ms";
+    return (
+      (auto ? "Auto: " : "") +
+      profile.label +
+      " · " +
+      profile.fMin +
+      "–" +
+      profile.fMax +
+      " Hz · " +
+      profile.symbolMs +
+      "ms/sym"
+    );
   };
 })(typeof globalThis !== "undefined" ? globalThis : window);

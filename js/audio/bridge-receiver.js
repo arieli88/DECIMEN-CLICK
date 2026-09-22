@@ -111,9 +111,30 @@
   }
 
   function ensureSessionFromFrame(frame) {
-    if (state.session && state.session.sessionId === frame.sessionId) return state.session;
-    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
-    // Create empty session skeleton matching frame params
+    if (state.session && state.session.sessionId === frame.sessionId) {
+      // Keep existing received[] — never wipe progress on META re-announce
+      if (frame.k && frame.k !== state.session.k) {
+        // Rare: grow array if sender reports larger k, preserve old blocks
+        const next = new Array(frame.k).fill(null);
+        for (let i = 0; i < state.session.received.length && i < next.length; i++) {
+          next[i] = state.session.received[i];
+        }
+        state.session.k = frame.k;
+        state.session.blockLen = frame.blockLen || state.session.blockLen;
+        state.session.totalLen = frame.totalLen || state.session.totalLen;
+        state.session.received = next;
+      }
+      return state.session;
+    }
+    // Different session — try restore from cache first
+    const cached = loadCachedSession(frame.sessionId);
+    if (cached) {
+      state.session = cached;
+      return state.session;
+    }
+    const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride, {
+      mode: state.mode,
+    });
     const k = frame.k || 1;
     const blockLen = frame.blockLen || 40;
     const totalLen = frame.totalLen || k * blockLen;
@@ -124,7 +145,6 @@
       sessionId: frame.sessionId,
       blockLen,
     });
-    // Override blocks with empty received tracking only — blocks array unused on RX
     state.session.k = k;
     state.session.blockLen = blockLen;
     state.session.totalLen = totalLen;
@@ -132,20 +152,91 @@
     return state.session;
   }
 
+  const RX_CACHE_KEY = "decimen-rx-v1";
+
+  function persistSession() {
+    const s = state.session;
+    if (!s || !s.sessionId) return;
+    try {
+      const blocks = [];
+      for (let i = 0; i < s.k; i++) {
+        if (!s.received[i]) continue;
+        blocks.push({ i: i, b64: DA.bytesToBase64(s.received[i]) });
+      }
+      const payload = {
+        sessionId: s.sessionId,
+        k: s.k,
+        blockLen: s.blockLen,
+        totalLen: s.totalLen,
+        blocks: blocks,
+        savedAt: Date.now(),
+      };
+      sessionStorage.setItem(RX_CACHE_KEY, JSON.stringify(payload));
+    } catch (_) {}
+  }
+
+  function loadCachedSession(sessionId) {
+    try {
+      const raw = sessionStorage.getItem(RX_CACHE_KEY);
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || data.sessionId !== sessionId) return null;
+      const profile = DA.resolveBandProfile(state.bandOverride === "auto" ? null : state.bandOverride);
+      const placeholder = new Uint8Array(data.totalLen || data.k * data.blockLen);
+      const s = DA.TransferEngine.createSession(placeholder, {
+        mode: state.mode,
+        profile,
+        sessionId: data.sessionId,
+        blockLen: data.blockLen,
+      });
+      s.k = data.k;
+      s.blockLen = data.blockLen;
+      s.totalLen = data.totalLen;
+      s.received = new Array(data.k).fill(null);
+      (data.blocks || []).forEach((b) => {
+        if (b && b.i >= 0 && b.i < s.k && b.b64) s.received[b.i] = DA.base64ToBytes(b.b64);
+      });
+      return s;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function clearSessionCache() {
+    try {
+      sessionStorage.removeItem(RX_CACHE_KEY);
+    } catch (_) {}
+    state.session = null;
+    updateProgressUi();
+  }
+
   function updateProgressUi() {
     const s = state.session;
     const label = $("audio-progress-label");
     const missEl = $("audio-missing-label");
+    const explain = $("audio-progress-explain");
     if (!s) {
-      if (label) label.textContent = "—";
+      if (label) label.textContent = "— אין סשן עדיין";
       if (missEl) missEl.textContent = "—";
+      if (explain) explain.textContent = "האחוזים = בלוקי קובץ שהתקבלו (לא עוצמת מיקרופון).";
       return;
     }
     const solved = s.solvedCount();
-    const pct = Math.floor((100 * solved) / s.k);
-    if (label) label.textContent = pct + "% · " + solved + "/" + s.k + " blocks";
+    const pct = Math.floor((100 * solved) / Math.max(1, s.k));
+    if (label) {
+      label.textContent =
+        pct + "% · " + solved + "/" + s.k + " בלוקים שמורים" + (solved ? " ✓ נשמרים בזיכרון" : "");
+    }
     const missing = s.missing();
-    if (missEl) missEl.textContent = missing.length ? "Missing: " + missing.slice(0, 24).join(",") + (missing.length > 24 ? "…" : "") : "Complete";
+    if (missEl) {
+      missEl.textContent = missing.length
+        ? "חסרים: " + missing.slice(0, 20).join(",") + (missing.length > 20 ? "…" : "")
+        : "הושלם — כל הבלוקים התקבלו";
+    }
+    if (explain) {
+      explain.textContent =
+        "התקדמות = חלקי הקובץ שכבר נקלט (cache). גל המיקופון למעלה = עוצמה חיה, לא אחוזי קובץ.";
+    }
     const bar = $("audio-bar");
     if (bar) bar.style.width = pct + "%";
     const nackBtn = $("audio-nack-speak");
@@ -216,7 +307,8 @@
     }
     if (frame.kind === DA.FRAME_DATA) {
       const s = ensureSessionFromFrame(frame);
-      s.acceptBlock(frame.seq, frame.payload);
+      const accepted = s.acceptBlock(frame.seq, frame.payload);
+      if (accepted) persistSession();
       updateProgressUi();
       finishIfComplete();
     }
@@ -281,10 +373,19 @@
     if (preview) preview.style.display = "";
     state.camStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: "environment", width: { ideal: 1280 } },
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        // Continuous AF while hunting QR (supported devices only)
+        focusMode: { ideal: "continuous" },
+      },
     });
+    await applyContinuousAutofocus(state.camStream);
     video.srcObject = state.camStream;
     await video.play();
+    // Re-assert AF after tracks settle
+    setTimeout(() => applyContinuousAutofocus(state.camStream), 400);
+    setTimeout(() => applyContinuousAutofocus(state.camStream), 1200);
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     state.camTimer = setInterval(async () => {
@@ -317,6 +418,24 @@
     }, 120);
   }
 
+  async function applyContinuousAutofocus(stream) {
+    if (!stream) return;
+    const track = stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof track.getCapabilities !== "function") return;
+    try {
+      const caps = track.getCapabilities() || {};
+      const modes = caps.focusMode || [];
+      if (modes.indexOf("continuous") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        if (window.__decimenLog) window.__decimenLog("Camera autofocus: continuous");
+      } else if (modes.indexOf("auto") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "auto" }] });
+      }
+    } catch (err) {
+      if (window.__decimenLog) window.__decimenLog("Autofocus skip: " + ((err && err.message) || err));
+    }
+  }
+
   async function onStartAudioRecv() {
     try {
       applyModeUi();
@@ -324,9 +443,29 @@
         setStatus("למצב CAMERAONLY השתמשו ב-Start camera הרגיל.");
         return;
       }
-      stopListen();
+      // Keep incomplete session cache — do NOT wipe progress on re-listen
+      const keepSession = state.session && state.session.solvedCount() > 0 && state.session.solvedCount() < state.session.k;
+      if (state.listen) {
+        state.listen.stop();
+        state.listen = null;
+      }
       state.running = true;
-      state.session = null;
+      if (!keepSession) {
+        // Try hydrate from sessionStorage if any
+        try {
+          const raw = sessionStorage.getItem("decimen-rx-v1");
+          if (raw) {
+            const data = JSON.parse(raw);
+            if (data && data.sessionId) {
+              const restored = loadCachedSession(data.sessionId);
+              if (restored && restored.solvedCount() > 0) {
+                state.session = restored;
+                setStatus("שוחזרה התקדמות: " + restored.solvedCount() + "/" + restored.k + " בלוקים מהזיכרון");
+              }
+            }
+          }
+        } catch (_) {}
+      }
       updateProgressUi();
       if (state.mode === "SOUNDONLY" || state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB") {
         await startSoundListen();
@@ -334,7 +473,12 @@
       if (state.mode === "COMBINE" || state.mode === "CAM_SOUND_FB") {
         await startHybridCamera();
       }
-      setStatus("Receiving (" + state.mode + ")…");
+      setStatus(
+        "Receiving (" +
+          state.mode +
+          ")…" +
+          (state.session ? " · סשן פעיל " + state.session.solvedCount() + "/" + state.session.k : "")
+      );
     } catch (err) {
       const mapped = (window.__decimenMapError && window.__decimenMapError(err)) || String((err && err.message) || err);
       setStatus(mapped, true);
@@ -407,7 +551,12 @@
     $("audio-recv-stop") &&
       $("audio-recv-stop").addEventListener("click", () => {
         stopListen();
-        setStatus("Stopped");
+        setStatus("Stopped — התקדמות נשמרה בזיכרון");
+      });
+    $("audio-rx-clear") &&
+      $("audio-rx-clear").addEventListener("click", () => {
+        clearSessionCache();
+        setStatus("נוקה cache של בלוקים שהתקבלו");
       });
     $("audio-nack-speak") && $("audio-nack-speak").addEventListener("click", speakNack);
 

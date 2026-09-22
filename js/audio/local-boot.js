@@ -160,6 +160,45 @@
     }
   }
 
+  async function applyContinuousAutofocus(stream) {
+    if (!stream) return;
+    var track = stream.getVideoTracks && stream.getVideoTracks()[0];
+    if (!track || typeof track.getCapabilities !== "function") return;
+    try {
+      var caps = track.getCapabilities() || {};
+      var modes = caps.focusMode || [];
+      if (modes.indexOf("continuous") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "continuous" }] });
+        logDiag("Camera autofocus: continuous");
+      } else if (modes.indexOf("auto") >= 0) {
+        await track.applyConstraints({ advanced: [{ focusMode: "auto" }] });
+      }
+    } catch (err) {
+      /* unsupported on many desktops — ignore */
+    }
+  }
+
+  function watchCameraAutofocus() {
+    var video = $("video");
+    if (!video) return;
+    var lastStream = null;
+    function tick() {
+      var stream = video.srcObject;
+      if (stream && stream !== lastStream) {
+        lastStream = stream;
+        applyContinuousAutofocus(stream);
+        setTimeout(function () {
+          applyContinuousAutofocus(stream);
+        }, 500);
+        setTimeout(function () {
+          applyContinuousAutofocus(stream);
+        }, 1500);
+      }
+    }
+    setInterval(tick, 800);
+    video.addEventListener("playing", tick);
+  }
+
   function wire() {
     document.querySelectorAll('input[name="transport-mode"]').forEach(function (el) {
       el.addEventListener("change", adaptUi);
@@ -168,6 +207,7 @@
       });
     });
     adaptUi();
+    watchCameraAutofocus();
     // Delay check until bundle likely loaded
     setTimeout(selfCheck, 50);
     setTimeout(selfCheck, 400);
