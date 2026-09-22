@@ -12356,6 +12356,7 @@ var QRCode;!function(){function a(a){this.mode=c.MODE_8BIT_BYTE,this.data=a,this
       setStatus(String(err.message || err), true);
     }
     if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
+  }
 
   function cameraTxLoop() {
     if (!state.running || !state.session) return;

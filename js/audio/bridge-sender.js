@@ -264,6 +264,7 @@
       setStatus(String(err.message || err), true);
     }
     if (state.running) state.txTimer = setTimeout(soundTxLoop, 200);
+  }
 
   function cameraTxLoop() {
     if (!state.running || !state.session) return;
